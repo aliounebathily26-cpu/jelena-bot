@@ -17,18 +17,21 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def get_btc_candles(interval="15m", limit=10):
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": "BTCUSDT", "interval": interval, "limit": limit}
+def get_btc_candles(interval="15", limit=10):
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {"category": "spot", "symbol": "BTCUSDT", "interval": interval, "limit": limit}
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
+        if data.get("retCode") != 0:
+            print(f"Bybit error: {data.get('retMsg')}")
+            return []
         candles = []
-        for c in data:
+        for c in data["result"]["list"]:
             open_price = float(c[1])
-            close_price = float(c[4])
             high = float(c[2])
             low = float(c[3])
+            close_price = float(c[4])
             body_size = abs(close_price - open_price)
             total_range = high - low
             candles.append({
@@ -41,9 +44,10 @@ def get_btc_candles(interval="15m", limit=10):
                 "total_range": total_range,
                 "body_ratio": body_size / total_range if total_range > 0 else 0
             })
+        candles.reverse()
         return candles
     except Exception as e:
-        print(f"Binance error: {e}")
+        print(f"Bybit error: {e}")
         return []
 
 def get_trend(candles_h1, candles_h4):
@@ -78,25 +82,28 @@ def format_signal(direction, candles_15m):
     trend_emoji = "🟢" if direction == "UP" else "🔴"
     arrow = "⬆️" if direction == "UP" else "⬇️"
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    msg = f"{trend_emoji} <b>SIGNAL JELENA - BTC</b> {trend_emoji}\n\n{arrow} Direction : <b>{direction}</b>\n💰 Prix : <b>${current_price:,.2f}</b>\n🕐 Heure : {now}\n\n✅ 3+ bougies consécutives\n✅ Bougies fortes\n✅ Aligné tendance H1/H4\n\n⚠️ Max 20% du capital"
+    msg = f"{trend_emoji} <b>SIGNAL JELENA - BTC</b> {trend_emoji}\n\n{arrow} Direction : <b>{direction}</b>\n💰 Prix : <b>${current_price:,.2f}</b>\n🕐 Heure : {now}\n\n✅ {MIN_CANDLES}+ bougies consécutives fortes\n✅ Aligné tendance H1/H4\n\n⚠️ Max 20% du capital\n⚠️ Stop si 2 pertes d'affilée"
     return msg
 
 def main():
-    send_telegram("🤖 <b>Jelena Bot démarré</b>\nSurveillance BTC 15min active...")
+    send_telegram("🤖 <b>Jelena Bot v2 démarré</b>\nSurveillance BTC 15min active...")
     trades_today = 0
     consecutive_losses = 0
     last_signal = None
     last_signal_time = 0
     session_active = True
-    print("Bot started.")
+    last_day = datetime.datetime.now().day
+    print("Jelena Bot v2 started - Bybit API")
     while True:
         try:
             now = time.time()
-            current_hour = datetime.datetime.now().hour
-            if current_hour == 0 and datetime.datetime.now().minute == 0:
+            current_day = datetime.datetime.now().day
+            if current_day != last_day:
                 trades_today = 0
                 consecutive_losses = 0
                 session_active = True
+                last_day = current_day
+                send_telegram("🔄 Nouveau jour - Compteurs remis à zéro")
             if not session_active:
                 time.sleep(60)
                 continue
@@ -109,21 +116,22 @@ def main():
                     session_active = False
                 time.sleep(60)
                 continue
-            candles_15m = get_btc_candles("15m", 10)
-            candles_h1 = get_btc_candles("1h", 6)
-            candles_h4 = get_btc_candles("4h", 4)
+            candles_15m = get_btc_candles("15", 10)
+            candles_h1 = get_btc_candles("60", 6)
+            candles_h4 = get_btc_candles("240", 4)
             if not candles_15m:
                 time.sleep(30)
                 continue
             trend = get_trend(candles_h1, candles_h4)
             signal = check_signal(candles_15m, trend)
+            print(f"{datetime.datetime.now().strftime('%H:%M')} | BTC: ${candles_15m[-1]['close']:,.0f} | Trend: {trend} | Signal: {signal}")
             if signal and (now - last_signal_time > 900) and signal != last_signal:
                 message = format_signal(signal, candles_15m)
                 send_telegram(message)
                 last_signal = signal
                 last_signal_time = now
                 trades_today += 1
-                print(f"Signal: {signal} | Trades: {trades_today}")
+                print(f"Signal sent: {signal} | Trades: {trades_today}")
             time.sleep(60)
         except KeyboardInterrupt:
             send_telegram("⏹️ Bot arrêté")

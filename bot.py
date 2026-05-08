@@ -8,8 +8,14 @@ from dotenv import load_dotenv
 
 try:
     from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
 except Exception as e:
     ClobClient = None
+    MarketOrderArgs = None
+    OrderType = None
+    BUY = "BUY"
+    SELL = "SELL"
     POLY_IMPORT_ERROR = str(e)
 else:
     POLY_IMPORT_ERROR = None
@@ -28,18 +34,61 @@ POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
 
 WINDOW_SECONDS = 15 * 60
 
+REAL_TRADING_ENABLED = True
+TRADE_AMOUNT_USD = 1.00
+
 MAX_ENTRY_PRICE = 0.70
 MIN_TIME_LEFT_SECONDS = 5 * 60
 MAX_TIME_LEFT_SECONDS = 13 * 60
 
-BTC_SIGNAL_THRESHOLD = 0.20
+BTC_SIGNAL_THRESHOLD = 0.08
 MIN_BTC_HISTORY_SECONDS = 3 * 60
 
-CHECK_INTERVAL_SECONDS = 60
+TAKE_PROFIT_MULTIPLIER = 1.30
+EXIT_BEFORE_END_SECONDS = 120
+
+MAX_TRADES_PER_MARKET = 1
+MAX_TRADES_PER_DAY = 5
+MAX_LOSSES_PER_DAY = 2
+
+CHECK_INTERVAL_SECONDS = 30
+
+STATE_FILE = "bot_state.json"
 
 price_history = deque(maxlen=30)
-last_sent_decision = None
-last_sent_time = 0
+poly_client = None
+
+
+def load_state():
+    default_state = {
+        "current_position": None,
+        "traded_markets": [],
+        "trades_today": 0,
+        "losses_today": 0,
+        "day": datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    }
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+    except Exception:
+        return default_state
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if state.get("day") != today:
+        state["day"] = today
+        state["trades_today"] = 0
+        state["losses_today"] = 0
+        state["traded_markets"] = []
+        state["current_position"] = None
+
+    return state
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 def send_telegram(message):
@@ -58,53 +107,57 @@ def send_telegram(message):
     print(response.status_code, response.text)
 
 
-def test_polymarket_auth():
+def init_polymarket_client():
+    global poly_client
+
     if ClobClient is None:
-        return f"❌ Module Polymarket non importé : {POLY_IMPORT_ERROR}"
+        raise ValueError(f"Module Polymarket non importé : {POLY_IMPORT_ERROR}")
 
     if not POLY_PRIVATE_KEY:
-        return "❌ POLY_PRIVATE_KEY manquant."
+        raise ValueError("POLY_PRIVATE_KEY manquant")
 
     if not POLY_FUNDER_ADDRESS:
-        return "❌ POLY_FUNDER_ADDRESS manquant."
+        raise ValueError("POLY_FUNDER_ADDRESS manquant")
 
-    try:
-        temp_client = ClobClient(
-            POLY_HOST,
-            key=POLY_PRIVATE_KEY,
-            chain_id=POLY_CHAIN_ID,
-            signature_type=POLY_SIGNATURE_TYPE,
-            funder=POLY_FUNDER_ADDRESS
-        )
+    temp_client = ClobClient(
+        POLY_HOST,
+        key=POLY_PRIVATE_KEY,
+        chain_id=POLY_CHAIN_ID,
+        signature_type=POLY_SIGNATURE_TYPE,
+        funder=POLY_FUNDER_ADDRESS
+    )
 
-        creds = temp_client.create_or_derive_api_creds()
+    creds = temp_client.create_or_derive_api_creds()
 
-        client = ClobClient(
-            POLY_HOST,
-            key=POLY_PRIVATE_KEY,
-            chain_id=POLY_CHAIN_ID,
-            creds=creds,
-            signature_type=POLY_SIGNATURE_TYPE,
-            funder=POLY_FUNDER_ADDRESS
-        )
+    client = ClobClient(
+        POLY_HOST,
+        key=POLY_PRIVATE_KEY,
+        chain_id=POLY_CHAIN_ID,
+        creds=creds,
+        signature_type=POLY_SIGNATURE_TYPE,
+        funder=POLY_FUNDER_ADDRESS
+    )
 
-        if client is None:
-            return "❌ Client trading non créé."
-
-        return "✅ Auth Polymarket OK. Client trading initialisé. Aucun ordre placé."
-
-    except Exception as e:
-        return f"❌ Auth Polymarket échouée : {e}"
+    poly_client = client
+    return client
 
 
 def get_btc_price():
-    url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 
-    response = requests.get(url, timeout=10)
+    headers = {
+        "User-Agent": "jelena-polymarket-bot/1.0"
+    }
+
+    response = requests.get(url, headers=headers, timeout=10)
     response.raise_for_status()
 
     data = response.json()
-    return float(data["data"]["amount"])
+
+    if "price" not in data:
+        raise ValueError(f"Réponse Coinbase invalide : {data}")
+
+    return float(data["price"])
 
 
 def update_btc_history(price):
@@ -208,6 +261,30 @@ def get_buy_price(token_id):
     return float(price)
 
 
+def get_sell_price(token_id):
+    url = f"{POLY_HOST}/price"
+
+    params = {
+        "token_id": token_id,
+        "side": "SELL"
+    }
+
+    response = requests.get(url, params=params, timeout=15)
+
+    if response.status_code == 404:
+        return None
+
+    response.raise_for_status()
+    data = response.json()
+
+    price = data.get("price")
+
+    if price is None:
+        return None
+
+    return float(price)
+
+
 def parse_end_date(end_date):
     if not end_date:
         return None
@@ -274,14 +351,44 @@ def find_live_btc_15m_market():
     return None
 
 
-def decide_trade(market_data, btc_signal):
+def decide_trade(market_data, btc_signal, state):
     signal, change_pct, signal_reason = btc_signal
+
+    if state["current_position"] is not None:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": "position déjà ouverte"
+        }
+
+    if state["trades_today"] >= MAX_TRADES_PER_DAY:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": "limite trades journalière atteinte"
+        }
+
+    if state["losses_today"] >= MAX_LOSSES_PER_DAY:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": "stop après 2 pertes journalières"
+        }
 
     if market_data is None:
         return {
             "decision": "REFUSÉ",
             "side": None,
             "reason": "aucun marché BTC 15m valide trouvé"
+        }
+
+    market_id = str(market_data["market"].get("id"))
+
+    if market_id in state["traded_markets"]:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": "marché déjà tradé"
         }
 
     time_left = market_data["time_left"]
@@ -332,18 +439,162 @@ def decide_trade(market_data, btc_signal):
     }
 
 
-def format_message(market_data, btc_price, btc_signal, decision_data):
+def place_market_buy(token_id, amount_usd):
+    order_args = MarketOrderArgs(
+        token_id=token_id,
+        amount=float(amount_usd),
+        side=BUY,
+        order_type=OrderType.FOK
+    )
+
+    signed_order = poly_client.create_market_order(order_args)
+    response = poly_client.post_order(signed_order, OrderType.FOK)
+
+    return response
+
+
+def place_market_sell(token_id, shares):
+    order_args = MarketOrderArgs(
+        token_id=token_id,
+        amount=float(shares),
+        side=SELL,
+        order_type=OrderType.FOK
+    )
+
+    signed_order = poly_client.create_market_order(order_args)
+    response = poly_client.post_order(signed_order, OrderType.FOK)
+
+    return response
+
+
+def open_position(market_data, decision_data, state):
+    market = market_data["market"]
+    event = market_data["event"]
+
+    token_id = decision_data["token_id"]
+    side = decision_data["side"]
+    entry_price = float(decision_data["price"])
+    market_id = str(market.get("id"))
+
+    response = place_market_buy(token_id, TRADE_AMOUNT_USD)
+
+    estimated_shares = round((TRADE_AMOUNT_USD / entry_price) * 0.98, 4)
+    take_profit_price = round(entry_price * TAKE_PROFIT_MULTIPLIER, 4)
+
+    position = {
+        "market_id": market_id,
+        "slug": market_data["slug"],
+        "title": event.get("title", "N/A"),
+        "side": side,
+        "token_id": token_id,
+        "entry_price": entry_price,
+        "take_profit_price": take_profit_price,
+        "amount_usd": TRADE_AMOUNT_USD,
+        "estimated_shares": estimated_shares,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "end_date": event.get("endDate"),
+        "buy_response": str(response)
+    }
+
+    state["current_position"] = position
+    state["traded_markets"].append(market_id)
+    state["trades_today"] += 1
+    save_state(state)
+
+    send_telegram(
+        "🟢 <b>ACHAT RÉEL PLACÉ</b>\n\n"
+        f"Marché : {position['title']}\n"
+        f"Side : <b>{side}</b>\n"
+        f"Montant : <b>{TRADE_AMOUNT_USD}$</b>\n"
+        f"Prix entrée estimé : <b>{entry_price}</b>\n"
+        f"Objectif +30% : <b>{take_profit_price}</b>\n"
+        f"Shares estimées : <b>{estimated_shares}</b>\n\n"
+        "Mode : FOK."
+    )
+
+
+def manage_position(state):
+    position = state.get("current_position")
+
+    if not position:
+        return
+
+    token_id = position["token_id"]
+    entry_price = float(position["entry_price"])
+    take_profit_price = float(position["take_profit_price"])
+    estimated_shares = float(position["estimated_shares"])
+
+    sell_price = get_sell_price(token_id)
+
+    if sell_price is None:
+        return
+
+    end_dt = parse_end_date(position["end_date"])
+    now = datetime.now(timezone.utc)
+    time_left = int((end_dt - now).total_seconds()) if end_dt else 999999
+
+    should_exit = False
+    exit_reason = None
+
+    if sell_price >= take_profit_price:
+        should_exit = True
+        exit_reason = f"take profit atteint : {sell_price} >= {take_profit_price}"
+
+    elif time_left <= EXIT_BEFORE_END_SECONDS:
+        should_exit = True
+        exit_reason = f"sortie sécurité avant fin : {time_left} sec restantes"
+
+    if not should_exit:
+        return
+
+    response = place_market_sell(token_id, estimated_shares)
+
+    pnl_pct = ((sell_price - entry_price) / entry_price) * 100
+
+    if pnl_pct < 0:
+        state["losses_today"] += 1
+
+    closed_position = state["current_position"]
+    state["current_position"] = None
+    save_state(state)
+
+    send_telegram(
+        "🔴 <b>SORTIE POSITION</b>\n\n"
+        f"Side : <b>{closed_position['side']}</b>\n"
+        f"Prix entrée : <b>{entry_price}</b>\n"
+        f"Prix sortie estimé : <b>{sell_price}</b>\n"
+        f"PnL estimé : <b>{pnl_pct:+.2f}%</b>\n"
+        f"Raison : {exit_reason}\n\n"
+        f"Réponse vente : <code>{str(response)[:800]}</code>"
+    )
+
+
+def format_decision_message(market_data, btc_price, btc_signal, decision_data, state):
     signal, change_pct, signal_reason = btc_signal
 
     lines = [
-        "🧠 <b>BOT POLYMARKET — DÉCISION AUTO</b>",
+        "🧠 <b>BOT POLYMARKET — RÉEL 1$</b>",
         "",
         f"BTC actuel : <b>${btc_price:,.2f}</b>",
         f"Signal BTC : <b>{signal or 'AUCUN'}</b>",
         f"Variation : <b>{change_pct:+.2f}%</b>",
         f"Raison signal : {signal_reason}",
         "",
+        f"Trades aujourd’hui : <b>{state['trades_today']}/{MAX_TRADES_PER_DAY}</b>",
+        f"Pertes aujourd’hui : <b>{state['losses_today']}/{MAX_LOSSES_PER_DAY}</b>",
+        "",
     ]
+
+    if state.get("current_position"):
+        pos = state["current_position"]
+        lines.extend([
+            "📌 <b>Position ouverte</b>",
+            f"Side : <b>{pos['side']}</b>",
+            f"Prix entrée : <b>{pos['entry_price']}</b>",
+            f"Objectif : <b>{pos['take_profit_price']}</b>",
+            f"Shares estimées : <b>{pos['estimated_shares']}</b>",
+            "",
+        ])
 
     if market_data:
         event = market_data["event"]
@@ -370,7 +621,7 @@ def format_message(market_data, btc_price, btc_signal, decision_data):
         f"Side : <b>{decision_data.get('side') or 'N/A'}</b>",
         f"Raison : {decision_data['reason']}",
         "",
-        "⚠️ Aucun ordre placé."
+        "⚠️ Trading réel activé : 1$ max par trade."
     ])
 
     return "\n".join(lines)
@@ -398,32 +649,47 @@ def should_send(decision_data):
 
 
 def main():
-    auth_status = test_polymarket_auth()
+    global poly_client
+
+    state = load_state()
+    poly_client = init_polymarket_client()
 
     send_telegram(
-        "🤖 <b>Bot Polymarket décision auto démarré</b>\n\n"
-        f"{auth_status}\n\n"
-        "Source BTC : Coinbase.\n"
-        "Mode actuel : décision automatique seulement.\n"
-        "Aucun ordre réel activé."
+        "🤖 <b>Bot Polymarket RÉEL 1$ démarré</b>\n\n"
+        "✅ Auth Polymarket OK.\n"
+        "✅ Trading réel activé.\n\n"
+        f"Montant : <b>{TRADE_AMOUNT_USD}$</b>\n"
+        f"Seuil BTC : <b>{BTC_SIGNAL_THRESHOLD}%</b>\n"
+        f"Take profit : <b>+30%</b>\n"
+        f"Sortie sécurité : <b>2 min avant fin</b>\n"
+        f"Max trades/jour : <b>{MAX_TRADES_PER_DAY}</b>\n"
+        f"Stop pertes/jour : <b>{MAX_LOSSES_PER_DAY}</b>"
     )
 
-    print("Bot décision auto en ligne.")
+    print("Bot réel 1$ en ligne.")
 
     while True:
         try:
+            state = load_state()
+
+            manage_position(state)
+
             btc_price = get_btc_price()
             update_btc_history(btc_price)
 
             btc_signal = get_btc_signal()
             market_data = find_live_btc_15m_market()
-            decision_data = decide_trade(market_data, btc_signal)
+            decision_data = decide_trade(market_data, btc_signal, state)
 
-            message = format_message(
+            if decision_data["decision"] == "ACHAT AUTORISÉ" and REAL_TRADING_ENABLED:
+                open_position(market_data, decision_data, state)
+
+            message = format_decision_message(
                 market_data,
                 btc_price,
                 btc_signal,
-                decision_data
+                decision_data,
+                state
             )
 
             print(message)
@@ -434,7 +700,7 @@ def main():
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except Exception as e:
-            error_message = f"❌ Erreur bot décision auto : {e}"
+            error_message = f"❌ Erreur bot réel 1$ : {e}"
             print(error_message)
             send_telegram(error_message)
             time.sleep(CHECK_INTERVAL_SECONDS)

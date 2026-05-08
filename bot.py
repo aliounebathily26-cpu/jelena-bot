@@ -3,10 +3,20 @@ import time
 import requests
 from dotenv import load_dotenv
 
+try:
+    from py_clob_client.client import ClobClient
+except Exception as e:
+    ClobClient = None
+    POLY_IMPORT_ERROR = str(e)
+else:
+    POLY_IMPORT_ERROR = None
+
+
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
 
 
 def send_telegram(message):
@@ -25,8 +35,27 @@ def send_telegram(message):
     print(response.status_code, response.text)
 
 
+def test_polymarket_import():
+    if ClobClient is None:
+        return f"❌ Import Polymarket échoué : {POLY_IMPORT_ERROR}"
+
+    try:
+        client = ClobClient(POLY_HOST)
+        return "✅ Polymarket importé. Client CLOB créé."
+    except Exception as e:
+        return f"⚠️ Polymarket importé, mais client non initialisé : {e}"
+
+
 def main():
-    send_telegram("🤖 Bot Polymarket démarré. Base propre.")
+    result = test_polymarket_import()
+
+    send_telegram(
+        "🤖 <b>Bot Polymarket démarré</b>\n"
+        "Base propre active.\n\n"
+        f"{result}\n\n"
+        "Aucun ordre automatique activé."
+    )
+
     print("Bot en ligne. Attente active.")
 
     while True:

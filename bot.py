@@ -46,105 +46,64 @@ def test_polymarket_import():
         return f"⚠️ Polymarket importé, mais client non initialisé : {e}"
 
 
-def is_btc_up_down_short_term_market(market):
-    question = market.get("question", "") or ""
-    title = market.get("title", "") or ""
-    slug = market.get("slug", "") or ""
-
-    text = f"{question} {title} {slug}".lower()
-
-    btc_words = ["btc", "bitcoin"]
-    direction_words = ["up or down", "up/down", "up", "down"]
-    short_term_words = [
-        "15m",
-        "15 min",
-        "15 minute",
-        "15-minute",
-        "15 minutes",
-        "hour",
-        "1 hour",
-        "today",
-        "daily"
-    ]
-
-    bad_words = [
-        "gta",
-        "$1m",
-        "1m",
-        "million",
-        "before",
-        "2027",
-        "2028",
-        "2029",
-        "2030",
-        "election",
-        "etf",
-        "reserve",
-        "country",
-        "company"
-    ]
-
-    has_btc = any(word in text for word in btc_words)
-    has_direction = any(word in text for word in direction_words)
-    has_short_term = any(word in text for word in short_term_words)
-    has_bad_word = any(word in text for word in bad_words)
-
-    return has_btc and has_direction and has_short_term and not has_bad_word
-
-
-def get_polymarket_btc_updown_markets():
+def get_all_active_markets():
     url = "https://gamma-api.polymarket.com/markets"
 
     params = {
         "active": "true",
         "closed": "false",
-        "limit": 500
+        "limit": 1000
     }
 
-    response = requests.get(url, params=params, timeout=15)
+    response = requests.get(url, params=params, timeout=20)
     response.raise_for_status()
 
-    markets = response.json()
+    return response.json()
 
-    filtered_markets = []
+
+def get_debug_btc_markets():
+    markets = get_all_active_markets()
+    btc_markets = []
 
     for market in markets:
-        if is_btc_up_down_short_term_market(market):
-            filtered_markets.append(market)
+        question = market.get("question", "") or ""
+        title = market.get("title", "") or ""
+        slug = market.get("slug", "") or ""
 
-    return filtered_markets[:10]
+        text = f"{question} {title} {slug}".lower()
+
+        if "btc" in text or "bitcoin" in text:
+            btc_markets.append(market)
+
+    return btc_markets[:20]
 
 
-def format_markets_message(markets):
+def format_debug_message(markets):
     if not markets:
         return (
-            "📊 <b>Marchés BTC Up/Down court terme</b>\n\n"
-            "Aucun marché BTC Up/Down court terme trouvé.\n\n"
-            "Possibilités :\n"
-            "- le marché n'est pas dans les 500 premiers résultats\n"
-            "- le nom du marché est différent\n"
-            "- le filtre est encore trop strict\n\n"
-            "Aucun ordre automatique activé."
+            "🔍 <b>DEBUG BTC POLYMARKET</b>\n\n"
+            "Aucun marché contenant BTC ou Bitcoin trouvé dans les 1000 premiers marchés actifs.\n\n"
+            "Conclusion : il faudra chercher autrement."
         )
 
     lines = [
-        "📊 <b>Marchés BTC Up/Down court terme détectés</b>",
+        "🔍 <b>DEBUG BTC POLYMARKET</b>",
+        "",
+        f"Marchés trouvés : {len(markets)}",
         "",
     ]
 
     for i, market in enumerate(markets, start=1):
-        question = market.get("question", "Sans titre")
-        market_id = market.get("id", "N/A")
-        liquidity = market.get("liquidity", "N/A")
-        volume = market.get("volume", "N/A")
-        end_date = market.get("endDate", "N/A")
+        question = market.get("question", "Sans question")
+        title = market.get("title", "Sans titre")
         slug = market.get("slug", "N/A")
+        market_id = market.get("id", "N/A")
+        end_date = market.get("endDate", "N/A")
 
         lines.append(f"<b>{i}. {question}</b>")
-        lines.append(f"ID : <code>{market_id}</code>")
+        lines.append(f"Title : {title}")
         lines.append(f"Slug : <code>{slug}</code>")
-        lines.append(f"Liquidité : {liquidity}")
-        lines.append(f"Volume : {volume}")
+        lines.append(f"ID : <code>{market_id}</code>")
         lines.append(f"Fin : {end_date}")
         lines.append("")
 
@@ -156,19 +115,18 @@ def main():
     status = test_polymarket_import()
 
     try:
-        markets = get_polymarket_btc_updown_markets()
-        markets_message = format_markets_message(markets)
+        markets = get_debug_btc_markets()
+        debug_message = format_debug_message(markets)
     except Exception as e:
-        markets_message = f"❌ Erreur lecture marchés Polymarket : {e}"
+        debug_message = f"❌ Erreur debug marchés Polymarket : {e}"
 
     send_telegram(
-        "🤖 <b>Bot Polymarket démarré</b>\n"
-        "Recherche BTC Up/Down court terme.\n\n"
+        "🤖 <b>Bot Polymarket DEBUG démarré</b>\n\n"
         f"{status}\n\n"
-        f"{markets_message}"
+        f"{debug_message}"
     )
 
-    print("Bot en ligne. Attente active.")
+    print("Bot debug en ligne. Attente active.")
 
     while True:
         time.sleep(60)

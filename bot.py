@@ -47,16 +47,16 @@ MIN_BTC_HISTORY_SECONDS = 3 * 60
 TAKE_PROFIT_MULTIPLIER = 1.30
 EXIT_BEFORE_END_SECONDS = 120
 
-MAX_TRADES_PER_MARKET = 1
 MAX_TRADES_PER_DAY = 5
 MAX_LOSSES_PER_DAY = 2
 
 CHECK_INTERVAL_SECONDS = 30
-
 STATE_FILE = "bot_state.json"
 
 price_history = deque(maxlen=30)
 poly_client = None
+last_sent_decision = None
+last_sent_time = 0
 
 
 def load_state():
@@ -129,7 +129,7 @@ def init_polymarket_client():
 
     creds = temp_client.create_or_derive_api_creds()
 
-    client = ClobClient(
+    poly_client = ClobClient(
         POLY_HOST,
         key=POLY_PRIVATE_KEY,
         chain_id=POLY_CHAIN_ID,
@@ -138,8 +138,7 @@ def init_polymarket_client():
         funder=POLY_FUNDER_ADDRESS
     )
 
-    poly_client = client
-    return client
+    return poly_client
 
 
 def get_btc_price():
@@ -174,7 +173,6 @@ def get_btc_signal():
 
     current_time, current_price = price_history[-1]
     oldest_time, oldest_price = price_history[0]
-
     age = current_time - oldest_time
 
     if age < MIN_BTC_HISTORY_SECONDS:
@@ -237,36 +235,12 @@ def parse_json_field(value):
     return value
 
 
-def get_buy_price(token_id):
+def get_price(token_id, side):
     url = f"{POLY_HOST}/price"
 
     params = {
         "token_id": token_id,
-        "side": "BUY"
-    }
-
-    response = requests.get(url, params=params, timeout=15)
-
-    if response.status_code == 404:
-        return None
-
-    response.raise_for_status()
-    data = response.json()
-
-    price = data.get("price")
-
-    if price is None:
-        return None
-
-    return float(price)
-
-
-def get_sell_price(token_id):
-    url = f"{POLY_HOST}/price"
-
-    params = {
-        "token_id": token_id,
-        "side": "SELL"
+        "side": side
     }
 
     response = requests.get(url, params=params, timeout=15)
@@ -330,8 +304,8 @@ def find_live_btc_15m_market():
         if not outcomes or not token_ids or len(token_ids) < 2:
             continue
 
-        up_price = get_buy_price(token_ids[0])
-        down_price = get_buy_price(token_ids[1])
+        up_price = get_price(token_ids[0], "BUY")
+        down_price = get_price(token_ids[1], "BUY")
 
         if up_price is None or down_price is None:
             continue
@@ -443,8 +417,7 @@ def place_market_buy(token_id, amount_usd):
     order_args = MarketOrderArgs(
         token_id=token_id,
         amount=float(amount_usd),
-        side=BUY,
-        order_type=OrderType.FOK
+        side=BUY
     )
 
     signed_order = poly_client.create_market_order(order_args)
@@ -457,8 +430,7 @@ def place_market_sell(token_id, shares):
     order_args = MarketOrderArgs(
         token_id=token_id,
         amount=float(shares),
-        side=SELL,
-        order_type=OrderType.FOK
+        side=SELL
     )
 
     signed_order = poly_client.create_market_order(order_args)
@@ -509,7 +481,7 @@ def open_position(market_data, decision_data, state):
         f"Prix entrée estimé : <b>{entry_price}</b>\n"
         f"Objectif +30% : <b>{take_profit_price}</b>\n"
         f"Shares estimées : <b>{estimated_shares}</b>\n\n"
-        "Mode : FOK."
+        f"Réponse achat : <code>{str(response)[:800]}</code>"
     )
 
 
@@ -524,7 +496,7 @@ def manage_position(state):
     take_profit_price = float(position["take_profit_price"])
     estimated_shares = float(position["estimated_shares"])
 
-    sell_price = get_sell_price(token_id)
+    sell_price = get_price(token_id, "SELL")
 
     if sell_price is None:
         return

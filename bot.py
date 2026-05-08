@@ -2,6 +2,7 @@ import os
 import time
 import json
 import requests
+from collections import deque
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -27,6 +28,19 @@ POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
 
 WINDOW_SECONDS = 15 * 60
 
+MAX_ENTRY_PRICE = 0.70
+MIN_TIME_LEFT_SECONDS = 5 * 60
+MAX_TIME_LEFT_SECONDS = 13 * 60
+
+BTC_SIGNAL_THRESHOLD = 0.20
+MIN_BTC_HISTORY_SECONDS = 3 * 60
+
+CHECK_INTERVAL_SECONDS = 60
+
+price_history = deque(maxlen=30)
+last_sent_decision = None
+last_sent_time = 0
+
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -44,22 +58,15 @@ def send_telegram(message):
     print(response.status_code, response.text)
 
 
-def test_polymarket_import():
-    if ClobClient is None:
-        return f"❌ Import Polymarket échoué : {POLY_IMPORT_ERROR}"
-
-    return "✅ Polymarket importé."
-
-
 def test_polymarket_auth():
     if ClobClient is None:
-        return "❌ Auth impossible : module Polymarket non importé."
+        return "❌ Module Polymarket non importé."
 
     if not POLY_PRIVATE_KEY:
-        return "❌ Auth impossible : POLY_PRIVATE_KEY manquant."
+        return "❌ POLY_PRIVATE_KEY manquant."
 
     if not POLY_FUNDER_ADDRESS:
-        return "❌ Auth impossible : POLY_FUNDER_ADDRESS manquant."
+        return "❌ POLY_FUNDER_ADDRESS manquant."
 
     try:
         temp_client = ClobClient(
@@ -81,16 +88,10 @@ def test_polymarket_auth():
             funder=POLY_FUNDER_ADDRESS
         )
 
-        # Petit test sans ordre : on vérifie que le client L2 existe.
         if client is None:
-            return "❌ Auth échouée : client L2 non créé."
+            return "❌ Client trading non créé."
 
-        return (
-            "✅ Auth Polymarket réussie.\n"
-            "✅ API credentials dérivés.\n"
-            "✅ Client trading initialisé.\n"
-            "⚠️ Aucun ordre placé."
-        )
+        return "✅ Auth Polymarket OK. Client trading initialisé. Aucun ordre placé."
 
     except Exception as e:
         return f"❌ Auth Polymarket échouée : {e}"
@@ -158,37 +159,101 @@ def get_buy_price(token_id):
     response.raise_for_status()
     data = response.json()
 
-    return data.get("price")
+    price = data.get("price")
+
+    if price is None:
+        return None
+
+    return float(price)
+
+
+def get_btc_price():
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": "bitcoin",
+        "vs_currencies": "usd"
+    }
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+
+    data = response.json()
+    return float(data["bitcoin"]["usd"])
+
+
+def update_btc_history(price):
+    now = time.time()
+    price_history.append((now, price))
+
+    while price_history and now - price_history[0][0] > 15 * 60:
+        price_history.popleft()
+
+
+def get_btc_signal():
+    if len(price_history) < 2:
+        return None, 0, "historique BTC insuffisant"
+
+    current_time, current_price = price_history[-1]
+    oldest_time, oldest_price = price_history[0]
+
+    age = current_time - oldest_time
+
+    if age < MIN_BTC_HISTORY_SECONDS:
+        return None, 0, "historique BTC trop court"
+
+    change_pct = ((current_price - oldest_price) / oldest_price) * 100
+
+    if change_pct >= BTC_SIGNAL_THRESHOLD:
+        return "UP", change_pct, "variation BTC haussière"
+
+    if change_pct <= -BTC_SIGNAL_THRESHOLD:
+        return "DOWN", change_pct, "variation BTC baissière"
+
+    return None, change_pct, "variation BTC trop faible"
+
+
+def parse_end_date(end_date):
+    if not end_date:
+        return None
+
+    clean = end_date.replace("Z", "+00:00")
+    return datetime.fromisoformat(clean)
+
+
+def get_time_left_seconds(event):
+    end_date = event.get("endDate")
+
+    end_dt = parse_end_date(end_date)
+
+    if not end_dt:
+        return None
+
+    now = datetime.now(timezone.utc)
+    return int((end_dt - now).total_seconds())
 
 
 def find_live_btc_15m_market():
-    checked = []
-
     for slug, ts in generate_candidate_slugs():
         event = get_event_by_slug(slug)
 
         if not event:
-            checked.append(f"{slug} → introuvable")
             continue
 
         market = extract_first_market(event)
 
         if not market:
-            checked.append(f"{slug} → aucun marché")
             continue
 
         outcomes = parse_json_field(market.get("outcomes"))
         token_ids = parse_json_field(market.get("clobTokenIds"))
 
         if not outcomes or not token_ids or len(token_ids) < 2:
-            checked.append(f"{slug} → token IDs incomplets")
             continue
 
         up_price = get_buy_price(token_ids[0])
         down_price = get_buy_price(token_ids[1])
 
         if up_price is None or down_price is None:
-            checked.append(f"{slug} → prix indisponibles")
             continue
 
         return {
@@ -200,78 +265,182 @@ def find_live_btc_15m_market():
             "token_ids": token_ids,
             "up_price": up_price,
             "down_price": down_price,
-            "checked": checked
+        }
+
+    return None
+
+
+def decide_trade(market_data, btc_signal):
+    signal, change_pct, signal_reason = btc_signal
+
+    if market_data is None:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": "aucun marché BTC 15m actif trouvé"
+        }
+
+    event = market_data["event"]
+    time_left = get_time_left_seconds(event)
+
+    if time_left is None:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": "temps restant inconnu"
+        }
+
+    if time_left < MIN_TIME_LEFT_SECONDS:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": f"temps restant trop faible : {time_left // 60} min"
+        }
+
+    if time_left > MAX_TIME_LEFT_SECONDS:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": f"fenêtre trop tôt : {time_left // 60} min restantes"
+        }
+
+    if signal is None:
+        return {
+            "decision": "REFUSÉ",
+            "side": None,
+            "reason": signal_reason
+        }
+
+    if signal == "UP":
+        selected_price = market_data["up_price"]
+        selected_side = "UP"
+        selected_token = market_data["token_ids"][0]
+    else:
+        selected_price = market_data["down_price"]
+        selected_side = "DOWN"
+        selected_token = market_data["token_ids"][1]
+
+    if selected_price > MAX_ENTRY_PRICE:
+        return {
+            "decision": "REFUSÉ",
+            "side": selected_side,
+            "reason": f"prix trop élevé : {selected_price}"
         }
 
     return {
-        "slug": None,
-        "checked": checked
+        "decision": "ACHAT AUTORISÉ",
+        "side": selected_side,
+        "price": selected_price,
+        "token_id": selected_token,
+        "reason": f"signal {selected_side} + prix OK + temps OK"
     }
 
 
-def format_market_message(data):
-    if not data.get("slug"):
-        lines = [
-            "❌ <b>Aucun marché BTC Up/Down 15m actif trouvé</b>",
+def format_message(market_data, btc_price, btc_signal, decision_data):
+    signal, change_pct, signal_reason = btc_signal
+
+    lines = [
+        "🧠 <b>BOT POLYMARKET — DÉCISION AUTO</b>",
+        "",
+        f"BTC actuel : <b>${btc_price:,.2f}</b>",
+        f"Signal BTC : <b>{signal or 'AUCUN'}</b>",
+        f"Variation : <b>{change_pct:+.2f}%</b>",
+        f"Raison signal : {signal_reason}",
+        "",
+    ]
+
+    if market_data:
+        event = market_data["event"]
+        market = market_data["market"]
+        time_left = get_time_left_seconds(event)
+
+        lines.extend([
+            "📈 <b>Marché détecté</b>",
+            f"Titre : {event.get('title', 'N/A')}",
+            f"Slug : <code>{market_data['slug']}</code>",
+            f"Market ID : <code>{market.get('id', 'N/A')}</code>",
+            f"Temps restant : <b>{time_left // 60 if time_left else 'N/A'} min</b>",
+            f"BUY Up : <b>{market_data['up_price']}</b>",
+            f"BUY Down : <b>{market_data['down_price']}</b>",
             "",
-            "Slugs testés :",
-        ]
+        ])
+    else:
+        lines.append("❌ Aucun marché live trouvé.")
+        lines.append("")
 
-        for item in data.get("checked", []):
-            lines.append(f"- {item}")
+    lines.extend([
+        "⚙️ <b>Décision</b>",
+        f"Résultat : <b>{decision_data['decision']}</b>",
+        f"Side : <b>{decision_data.get('side') or 'N/A'}</b>",
+        f"Raison : {decision_data['reason']}",
+        "",
+        "⚠️ Aucun ordre placé."
+    ])
 
-        return "\n".join(lines)
+    return "\n".join(lines)
 
-    event = data["event"]
-    market = data["market"]
 
-    title = event.get("title", "Sans titre")
-    market_id = market.get("id", "N/A")
-    end_date = event.get("endDate", "N/A")
-    liquidity = market.get("liquidity", "N/A")
-    volume = market.get("volume", "N/A")
+def should_send(decision_data):
+    global last_sent_decision, last_sent_time
 
-    ts_readable = datetime.fromtimestamp(
-        data["timestamp"],
-        tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = time.time()
+    decision_key = f"{decision_data['decision']}|{decision_data.get('side')}|{decision_data['reason']}"
 
-    return (
-        "📈 <b>BTC UP/DOWN 15M — LIVE</b>\n\n"
-        f"<b>Titre :</b> {title}\n"
-        f"<b>Slug actif :</b> <code>{data['slug']}</code>\n"
-        f"<b>Timestamp :</b> {ts_readable}\n"
-        f"<b>Market ID :</b> <code>{market_id}</code>\n"
-        f"<b>Fin :</b> {end_date}\n"
-        f"<b>Liquidité :</b> {liquidity}\n"
-        f"<b>Volume :</b> {volume}\n\n"
-        f"🟢 <b>BUY Up :</b> {data['up_price']}\n"
-        f"🔴 <b>BUY Down :</b> {data['down_price']}\n"
-    )
+    if decision_data["decision"] == "ACHAT AUTORISÉ":
+        return True
+
+    if decision_key != last_sent_decision:
+        last_sent_decision = decision_key
+        last_sent_time = now
+        return True
+
+    if now - last_sent_time > 5 * 60:
+        last_sent_time = now
+        return True
+
+    return False
 
 
 def main():
-    import_status = test_polymarket_import()
     auth_status = test_polymarket_auth()
 
-    try:
-        market_data = find_live_btc_15m_market()
-        market_message = format_market_message(market_data)
-    except Exception as e:
-        market_message = f"❌ Erreur marché live : {e}"
-
     send_telegram(
-        "🤖 <b>Bot Polymarket AUTH démarré</b>\n\n"
-        f"{import_status}\n\n"
+        "🤖 <b>Bot Polymarket décision auto démarré</b>\n\n"
         f"{auth_status}\n\n"
-        f"{market_message}\n\n"
-        "Aucun ordre automatique activé."
+        "Mode actuel : décision automatique seulement.\n"
+        "Aucun ordre réel activé."
     )
 
-    print("Bot auth en ligne. Attente active.")
+    print("Bot décision auto en ligne.")
 
     while True:
-        time.sleep(60)
+        try:
+            btc_price = get_btc_price()
+            update_btc_history(btc_price)
+
+            btc_signal = get_btc_signal()
+            market_data = find_live_btc_15m_market()
+            decision_data = decide_trade(market_data, btc_signal)
+
+            message = format_message(
+                market_data,
+                btc_price,
+                btc_signal,
+                decision_data
+            )
+
+            print(message)
+
+            if should_send(decision_data):
+                send_telegram(message)
+
+            time.sleep(CHECK_INTERVAL_SECONDS)
+
+        except Exception as e:
+            error_message = f"❌ Erreur bot décision auto : {e}"
+            print(error_message)
+            send_telegram(error_message)
+            time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

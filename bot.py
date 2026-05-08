@@ -2,175 +2,103 @@ import requests
 import time
 import datetime
 
-TELEGRAM_TOKEN = "TON_TOKEN_ICI"
-CHAT_ID = "TON_CHAT_ID_ICI"
+TELEGRAM_TOKEN = "8539436833:AAEbwacljaENAab9bkdn2VY7OMoov503GPQ"
+CHAT_ID = "8754609023"
+COINGECKO_KEY = "CG-4XBTEsUxjpA9RbpgcX8nZRgF"
 
 THRESHOLD = 0.4
-INTERVAL = "15"
-LIMIT = 8
-COOLDOWN_SECONDS = 600
-
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
 
-
-def get_btc_candles(interval=INTERVAL, limit=LIMIT):
-    url = "https://api.bybit.com/v5/market/kline"
-
-    params = {
-        "category": "spot",
-        "symbol": "BTCUSDT",
-        "interval": interval,
-        "limit": limit
-    }
-
+def get_btc_price():
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    headers = {"x-cg-demo-api-key": COINGECKO_KEY}
+    params = {"ids": "bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"}
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        data = r.json()
+        return data["bitcoin"]["usd"], data["bitcoin"]["usd_24h_change"]
+    except Exception as e:
+        print(f"CoinGecko error: {e}")
+        return None, None
 
-        print("BYBIT STATUS:", r.status_code)
-        print("BYBIT RAW:", r.text[:500])
-
-        try:
-            data = r.json()
-        except Exception as e:
-            print(f"Bybit JSON parse error: {e}")
+def get_btc_ohlc():
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc"
+    headers = {"x-cg-demo-api-key": COINGECKO_KEY}
+    params = {"vs_currency": "usd", "days": "1"}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        data = r.json()
+        if not data or len(data) < 3:
             return []
-
-        if data.get("retCode") != 0:
-            print("Bybit API error:", data)
-            return []
-
-        raw_candles = data.get("result", {}).get("list", [])
-
-        if not raw_candles:
-            print("No candles received")
-            return []
-
         candles = []
-
-        for c in raw_candles:
+        for c in data[-6:]:
             open_price = float(c[1])
-            high = float(c[2])
-            low = float(c[3])
             close_price = float(c[4])
-            volume = float(c[5])
-
+            change_pct = ((close_price - open_price) / open_price) * 100
             candles.append({
                 "open": open_price,
                 "close": close_price,
-                "high": high,
-                "low": low,
-                "volume": volume,
-                "change_pct": ((close_price - open_price) / open_price) * 100
+                "change_pct": change_pct
             })
-
-        candles.reverse()
         return candles
-
     except Exception as e:
-        print(f"Bybit request error: {e}")
+        print(f"CoinGecko OHLC error: {e}")
         return []
 
-
 def check_signal(candles):
-    if len(candles) < 6:
+    if len(candles) < 2:
         return None
-
     current = candles[-2]
-
-    avg_volume = sum(c["volume"] for c in candles[-6:-1]) / 5
-
-    if current["volume"] < avg_volume * 0.8:
-        return None
-
     if current["change_pct"] >= THRESHOLD:
         return "UP"
-
-    if current["change_pct"] <= -THRESHOLD:
+    elif current["change_pct"] <= -THRESHOLD:
         return "DOWN"
-
     return None
 
-
-def format_signal(direction, candles):
-    current_price = candles[-1]["close"]
-    change = candles[-2]["change_pct"]
-
+def format_signal(direction, price, change):
     trend_emoji = "🟢" if direction == "UP" else "🔴"
     arrow = "⬆️" if direction == "UP" else "⬇️"
     now = datetime.datetime.now().strftime("%H:%M:%S")
-
-    return (
-        f"{trend_emoji} <b>SIGNAL JELENA - BTC</b> {trend_emoji}\n\n"
-        f"{arrow} Direction : <b>{direction}</b>\n"
-        f"📊 Variation : <b>{change:+.2f}%</b>\n"
-        f"💰 Prix : <b>${current_price:,.2f}</b>\n"
-        f"🕐 Heure : {now}"
-    )
-
+    msg = f"{trend_emoji} <b>SIGNAL JELENA - BTC</b> {trend_emoji}\n\n{arrow} Direction : <b>{direction}</b>\n📊 Variation : <b>{change:+.2f}%</b>\n💰 Prix : <b>${price:,.2f}</b>\n🕐 Heure : {now}"
+    return msg
 
 def main():
-    send_telegram(
-        "🤖 <b>Jelena Bot v4 démarré</b>\n"
-        "Surveillance BTC 15min active.\n"
-        "Debug Bybit activé."
-    )
-
+    send_telegram("🤖 <b>Jelena Bot v4 démarré</b>\nSignaux BTC +/-0.4% - CoinGecko API")
     last_signal = None
     last_signal_time = 0
-
-    print("Jelena Bot v4 started")
-
+    print("Jelena Bot v4 started - CoinGecko API")
     while True:
         try:
             now = time.time()
-
-            candles = get_btc_candles()
-
-            if not candles:
-                print("No valid candles. Waiting...")
-                time.sleep(30)
+            candles = get_btc_ohlc()
+            price, change_24h = get_btc_price()
+            if not candles or price is None:
+                print("No data, retrying in 60s...")
+                time.sleep(60)
                 continue
-
             signal = check_signal(candles)
-
-            print(
-                f"{datetime.datetime.now().strftime('%H:%M')} | "
-                f"BTC: ${candles[-1]['close']:,.0f} | "
-                f"Change: {candles[-2]['change_pct']:+.2f}% | "
-                f"Signal: {signal}"
-            )
-
-            if signal and (now - last_signal_time > COOLDOWN_SECONDS) and signal != last_signal:
-                message = format_signal(signal, candles)
+            current_change = candles[-2]["change_pct"] if len(candles) >= 2 else 0
+            print(f"{datetime.datetime.now().strftime('%H:%M')} | BTC: ${price:,.0f} | Change: {current_change:+.2f}% | Signal: {signal}")
+            if signal and (now - last_signal_time > 600) and signal != last_signal:
+                message = format_signal(signal, price, current_change)
                 send_telegram(message)
-
                 last_signal = signal
                 last_signal_time = now
-
                 print(f"Signal sent: {signal}")
-
             time.sleep(60)
-
         except KeyboardInterrupt:
             send_telegram("⏹️ Bot arrêté")
             break
-
         except Exception as e:
-            print(f"Main loop error: {e}")
-            time.sleep(30)
-
+            print(f"Error: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()

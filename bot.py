@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import socks
 import socket
-socks.set_default_proxy(socks.SOCKS5, "us-free-20.protonvpn.net", 1080, username="1ybYPdUVooeza87Q", password="ClZyqXYgEwNmpETLuY7mFVj7XN0vRDq6")
+socks.set_default_proxy(socks.SOCKS5, "us-az-92.protonvpn.net", 1080, username="1ybYPdUVooeza87Q", password="ClZyqXYgEwNmpETLuY7mFVj7XN0vRDq6")
 socket.socket = socks.socksocket
 
 try:

@@ -46,19 +46,59 @@ def test_polymarket_import():
         return f"⚠️ Polymarket importé, mais client non initialisé : {e}"
 
 
-def get_polymarket_btc_markets():
-    """
-    Lecture publique uniquement.
-    Aucun wallet.
-    Aucun ordre.
-    Aucun trade.
-    """
+def is_btc_up_down_short_term_market(market):
+    question = market.get("question", "") or ""
+    title = market.get("title", "") or ""
+    slug = market.get("slug", "") or ""
+
+    text = f"{question} {title} {slug}".lower()
+
+    btc_words = ["btc", "bitcoin"]
+    direction_words = ["up or down", "up/down", "up", "down"]
+    short_term_words = [
+        "15m",
+        "15 min",
+        "15 minute",
+        "15-minute",
+        "15 minutes",
+        "hour",
+        "1 hour",
+        "today",
+        "daily"
+    ]
+
+    bad_words = [
+        "gta",
+        "$1m",
+        "1m",
+        "million",
+        "before",
+        "2027",
+        "2028",
+        "2029",
+        "2030",
+        "election",
+        "etf",
+        "reserve",
+        "country",
+        "company"
+    ]
+
+    has_btc = any(word in text for word in btc_words)
+    has_direction = any(word in text for word in direction_words)
+    has_short_term = any(word in text for word in short_term_words)
+    has_bad_word = any(word in text for word in bad_words)
+
+    return has_btc and has_direction and has_short_term and not has_bad_word
+
+
+def get_polymarket_btc_updown_markets():
     url = "https://gamma-api.polymarket.com/markets"
 
     params = {
         "active": "true",
         "closed": "false",
-        "limit": 100
+        "limit": 500
     }
 
     response = requests.get(url, params=params, timeout=15)
@@ -66,33 +106,29 @@ def get_polymarket_btc_markets():
 
     markets = response.json()
 
-    btc_markets = []
+    filtered_markets = []
 
     for market in markets:
-        question = market.get("question", "")
-        title = market.get("title", "")
-        text = f"{question} {title}".lower()
+        if is_btc_up_down_short_term_market(market):
+            filtered_markets.append(market)
 
-        if (
-            "bitcoin" in text
-            or "btc" in text
-            or ("up" in text and "down" in text)
-        ):
-            btc_markets.append(market)
-
-    return btc_markets[:5]
+    return filtered_markets[:10]
 
 
 def format_markets_message(markets):
     if not markets:
         return (
-            "📊 <b>Marchés BTC Polymarket</b>\n\n"
-            "Aucun marché BTC Up/Down trouvé dans les 100 premiers marchés actifs.\n\n"
+            "📊 <b>Marchés BTC Up/Down court terme</b>\n\n"
+            "Aucun marché BTC Up/Down court terme trouvé.\n\n"
+            "Possibilités :\n"
+            "- le marché n'est pas dans les 500 premiers résultats\n"
+            "- le nom du marché est différent\n"
+            "- le filtre est encore trop strict\n\n"
             "Aucun ordre automatique activé."
         )
 
     lines = [
-        "📊 <b>Marchés BTC Polymarket détectés</b>",
+        "📊 <b>Marchés BTC Up/Down court terme détectés</b>",
         "",
     ]
 
@@ -102,9 +138,11 @@ def format_markets_message(markets):
         liquidity = market.get("liquidity", "N/A")
         volume = market.get("volume", "N/A")
         end_date = market.get("endDate", "N/A")
+        slug = market.get("slug", "N/A")
 
         lines.append(f"<b>{i}. {question}</b>")
         lines.append(f"ID : <code>{market_id}</code>")
+        lines.append(f"Slug : <code>{slug}</code>")
         lines.append(f"Liquidité : {liquidity}")
         lines.append(f"Volume : {volume}")
         lines.append(f"Fin : {end_date}")
@@ -118,14 +156,14 @@ def main():
     status = test_polymarket_import()
 
     try:
-        markets = get_polymarket_btc_markets()
+        markets = get_polymarket_btc_updown_markets()
         markets_message = format_markets_message(markets)
     except Exception as e:
         markets_message = f"❌ Erreur lecture marchés Polymarket : {e}"
 
     send_telegram(
         "🤖 <b>Bot Polymarket démarré</b>\n"
-        "Base propre active.\n\n"
+        "Recherche BTC Up/Down court terme.\n\n"
         f"{status}\n\n"
         f"{markets_message}"
     )

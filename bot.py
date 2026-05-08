@@ -56,64 +56,62 @@ def get_event_by_slug(slug):
     return response.json()
 
 
-def extract_markets_from_event(event):
+def extract_first_market(event):
     markets = event.get("markets", [])
 
     if isinstance(markets, str):
-        try:
-            markets = json.loads(markets)
-        except Exception:
-            markets = []
-
-    return markets
-
-
-def format_event_message(event, markets):
-    title = event.get("title", "Sans titre")
-    event_id = event.get("id", "N/A")
-    slug = event.get("slug", "N/A")
-    active = event.get("active", "N/A")
-    closed = event.get("closed", "N/A")
-    end_date = event.get("endDate", "N/A")
-
-    lines = [
-        "🎯 <b>EVENT POLYMARKET CIBLÉ</b>",
-        "",
-        f"<b>Titre :</b> {title}",
-        f"<b>Event ID :</b> <code>{event_id}</code>",
-        f"<b>Slug :</b> <code>{slug}</code>",
-        f"<b>Actif :</b> {active}",
-        f"<b>Fermé :</b> {closed}",
-        f"<b>Fin :</b> {end_date}",
-        "",
-        f"Marchés associés : {len(markets)}",
-        "",
-    ]
+        markets = json.loads(markets)
 
     if not markets:
-        lines.append("❌ Aucun marché associé trouvé dans cet event.")
-        return "\n".join(lines)
+        raise ValueError("Aucun marché trouvé dans l'event")
 
-    for i, market in enumerate(markets[:5], start=1):
-        question = market.get("question", "Sans question")
-        market_id = market.get("id", "N/A")
-        condition_id = market.get("conditionId", "N/A")
-        liquidity = market.get("liquidity", "N/A")
-        volume = market.get("volume", "N/A")
-        outcomes = market.get("outcomes", "N/A")
-        clob_token_ids = market.get("clobTokenIds", "N/A")
+    return markets[0]
 
-        lines.append(f"<b>{i}. {question}</b>")
-        lines.append(f"Market ID : <code>{market_id}</code>")
-        lines.append(f"Condition ID : <code>{condition_id}</code>")
-        lines.append(f"Liquidité : {liquidity}")
-        lines.append(f"Volume : {volume}")
-        lines.append(f"Outcomes : <code>{outcomes}</code>")
-        lines.append(f"CLOB Token IDs : <code>{clob_token_ids}</code>")
-        lines.append("")
 
-    lines.append("Aucun ordre automatique activé.")
-    return "\n".join(lines)
+def parse_json_field(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def get_buy_price(token_id):
+    url = f"{POLY_HOST}/price"
+    params = {
+        "token_id": token_id,
+        "side": "BUY"
+    }
+
+    response = requests.get(url, params=params, timeout=15)
+    response.raise_for_status()
+
+    data = response.json()
+    return data.get("price")
+
+
+def format_price_message(event, market, outcomes, token_ids, up_price, down_price):
+    title = event.get("title", "Sans titre")
+    market_id = market.get("id", "N/A")
+    end_date = event.get("endDate", "N/A")
+    liquidity = market.get("liquidity", "N/A")
+    volume = market.get("volume", "N/A")
+
+    up_token = token_ids[0]
+    down_token = token_ids[1]
+
+    return (
+        "📈 <b>BTC UP/DOWN 15M — PRIX</b>\n\n"
+        f"<b>Titre :</b> {title}\n"
+        f"<b>Market ID :</b> <code>{market_id}</code>\n"
+        f"<b>Fin :</b> {end_date}\n"
+        f"<b>Liquidité :</b> {liquidity}\n"
+        f"<b>Volume :</b> {volume}\n\n"
+        f"<b>Outcomes :</b> <code>{outcomes}</code>\n\n"
+        f"🟢 <b>BUY Up :</b> {up_price}\n"
+        f"🔴 <b>BUY Down :</b> {down_price}\n\n"
+        f"<b>Up Token :</b> <code>{up_token}</code>\n"
+        f"<b>Down Token :</b> <code>{down_token}</code>\n\n"
+        "Aucun ordre automatique activé."
+    )
 
 
 def main():
@@ -121,18 +119,36 @@ def main():
 
     try:
         event = get_event_by_slug(EVENT_SLUG)
-        markets = extract_markets_from_event(event)
-        event_message = format_event_message(event, markets)
+        market = extract_first_market(event)
+
+        outcomes = parse_json_field(market.get("outcomes"))
+        token_ids = parse_json_field(market.get("clobTokenIds"))
+
+        if len(outcomes) < 2 or len(token_ids) < 2:
+            raise ValueError("Outcomes ou CLOB Token IDs incomplets")
+
+        up_price = get_buy_price(token_ids[0])
+        down_price = get_buy_price(token_ids[1])
+
+        price_message = format_price_message(
+            event,
+            market,
+            outcomes,
+            token_ids,
+            up_price,
+            down_price
+        )
+
     except Exception as e:
-        event_message = f"❌ Erreur lecture event ciblé : {e}"
+        price_message = f"❌ Erreur récupération prix : {e}"
 
     send_telegram(
-        "🤖 <b>Bot Polymarket SLUG démarré</b>\n\n"
+        "🤖 <b>Bot Polymarket PRIX démarré</b>\n\n"
         f"{status}\n\n"
-        f"{event_message}"
+        f"{price_message}"
     )
 
-    print("Bot slug en ligne. Attente active.")
+    print("Bot prix en ligne. Attente active.")
 
     while True:
         time.sleep(60)

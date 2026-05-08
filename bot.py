@@ -40,20 +40,94 @@ def test_polymarket_import():
         return f"❌ Import Polymarket échoué : {POLY_IMPORT_ERROR}"
 
     try:
-        client = ClobClient(POLY_HOST)
+        ClobClient(POLY_HOST)
         return "✅ Polymarket importé. Client CLOB créé."
     except Exception as e:
         return f"⚠️ Polymarket importé, mais client non initialisé : {e}"
 
 
+def get_polymarket_btc_markets():
+    """
+    Lecture publique uniquement.
+    Aucun wallet.
+    Aucun ordre.
+    Aucun trade.
+    """
+    url = "https://gamma-api.polymarket.com/markets"
+
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": 100
+    }
+
+    response = requests.get(url, params=params, timeout=15)
+    response.raise_for_status()
+
+    markets = response.json()
+
+    btc_markets = []
+
+    for market in markets:
+        question = market.get("question", "")
+        title = market.get("title", "")
+        text = f"{question} {title}".lower()
+
+        if (
+            "bitcoin" in text
+            or "btc" in text
+            or ("up" in text and "down" in text)
+        ):
+            btc_markets.append(market)
+
+    return btc_markets[:5]
+
+
+def format_markets_message(markets):
+    if not markets:
+        return (
+            "📊 <b>Marchés BTC Polymarket</b>\n\n"
+            "Aucun marché BTC Up/Down trouvé dans les 100 premiers marchés actifs.\n\n"
+            "Aucun ordre automatique activé."
+        )
+
+    lines = [
+        "📊 <b>Marchés BTC Polymarket détectés</b>",
+        "",
+    ]
+
+    for i, market in enumerate(markets, start=1):
+        question = market.get("question", "Sans titre")
+        market_id = market.get("id", "N/A")
+        liquidity = market.get("liquidity", "N/A")
+        volume = market.get("volume", "N/A")
+        end_date = market.get("endDate", "N/A")
+
+        lines.append(f"<b>{i}. {question}</b>")
+        lines.append(f"ID : <code>{market_id}</code>")
+        lines.append(f"Liquidité : {liquidity}")
+        lines.append(f"Volume : {volume}")
+        lines.append(f"Fin : {end_date}")
+        lines.append("")
+
+    lines.append("Aucun ordre automatique activé.")
+    return "\n".join(lines)
+
+
 def main():
-    result = test_polymarket_import()
+    status = test_polymarket_import()
+
+    try:
+        markets = get_polymarket_btc_markets()
+        markets_message = format_markets_message(markets)
+    except Exception as e:
+        markets_message = f"❌ Erreur lecture marchés Polymarket : {e}"
 
     send_telegram(
         "🤖 <b>Bot Polymarket démarré</b>\n"
         "Base propre active.\n\n"
-        f"{result}\n\n"
-        "Aucun ordre automatique activé."
+        f"{status}\n\n"
+        f"{markets_message}"
     )
 
     print("Bot en ligne. Attente active.")

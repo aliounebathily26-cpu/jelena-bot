@@ -37,15 +37,15 @@ WINDOW_SECONDS = 15 * 60
 REAL_TRADING_ENABLED = True
 TRADE_AMOUNT_USD = 1.00
 
-MAX_ENTRY_PRICE = 0.70
-MIN_TIME_LEFT_SECONDS = 5 * 60
-MAX_TIME_LEFT_SECONDS = 13 * 60
+MAX_ENTRY_PRICE = 0.75
+MIN_TIME_LEFT_SECONDS = 4 * 60
+MAX_TIME_LEFT_SECONDS = 20 * 60
 
-BTC_SIGNAL_THRESHOLD = 0.08
-MIN_BTC_HISTORY_SECONDS = 3 * 60
+BTC_SIGNAL_THRESHOLD = 0.05
+MIN_BTC_HISTORY_SECONDS = 2 * 60
 
 TAKE_PROFIT_MULTIPLIER = 1.30
-EXIT_BEFORE_END_SECONDS = 120
+EXIT_BEFORE_END_SECONDS = 90
 
 MAX_TRADES_PER_DAY = 5
 MAX_LOSSES_PER_DAY = 2
@@ -53,7 +53,7 @@ MAX_LOSSES_PER_DAY = 2
 CHECK_INTERVAL_SECONDS = 30
 STATE_FILE = "bot_state.json"
 
-price_history = deque(maxlen=30)
+price_history = deque(maxlen=40)
 poly_client = None
 last_sent_decision = None
 last_sent_time = 0
@@ -173,6 +173,7 @@ def get_btc_signal():
 
     current_time, current_price = price_history[-1]
     oldest_time, oldest_price = price_history[0]
+
     age = current_time - oldest_time
 
     if age < MIN_BTC_HISTORY_SECONDS:
@@ -632,8 +633,10 @@ def main():
         "✅ Trading réel activé.\n\n"
         f"Montant : <b>{TRADE_AMOUNT_USD}$</b>\n"
         f"Seuil BTC : <b>{BTC_SIGNAL_THRESHOLD}%</b>\n"
+        f"Temps entrée : <b>4 à 20 min restantes</b>\n"
+        f"Prix max entrée : <b>{MAX_ENTRY_PRICE}</b>\n"
         f"Take profit : <b>+30%</b>\n"
-        f"Sortie sécurité : <b>2 min avant fin</b>\n"
+        f"Sortie sécurité : <b>90 sec avant fin</b>\n"
         f"Max trades/jour : <b>{MAX_TRADES_PER_DAY}</b>\n"
         f"Stop pertes/jour : <b>{MAX_LOSSES_PER_DAY}</b>"
     )

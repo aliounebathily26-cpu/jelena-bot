@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 from dotenv import load_dotenv
 
@@ -17,6 +18,8 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
+
+EVENT_SLUG = "btc-updown-15m-1778265900"
 
 
 def send_telegram(message):
@@ -46,65 +49,67 @@ def test_polymarket_import():
         return f"⚠️ Polymarket importé, mais client non initialisé : {e}"
 
 
-def get_all_active_markets():
-    url = "https://gamma-api.polymarket.com/markets"
-
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 1000
-    }
-
-    response = requests.get(url, params=params, timeout=20)
+def get_event_by_slug(slug):
+    url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
+    response = requests.get(url, timeout=20)
     response.raise_for_status()
-
     return response.json()
 
 
-def get_debug_btc_markets():
-    markets = get_all_active_markets()
-    btc_markets = []
+def extract_markets_from_event(event):
+    markets = event.get("markets", [])
 
-    for market in markets:
-        question = market.get("question", "") or ""
-        title = market.get("title", "") or ""
-        slug = market.get("slug", "") or ""
+    if isinstance(markets, str):
+        try:
+            markets = json.loads(markets)
+        except Exception:
+            markets = []
 
-        text = f"{question} {title} {slug}".lower()
-
-        if "btc" in text or "bitcoin" in text:
-            btc_markets.append(market)
-
-    return btc_markets[:20]
+    return markets
 
 
-def format_debug_message(markets):
-    if not markets:
-        return (
-            "🔍 <b>DEBUG BTC POLYMARKET</b>\n\n"
-            "Aucun marché contenant BTC ou Bitcoin trouvé dans les 1000 premiers marchés actifs.\n\n"
-            "Conclusion : il faudra chercher autrement."
-        )
+def format_event_message(event, markets):
+    title = event.get("title", "Sans titre")
+    event_id = event.get("id", "N/A")
+    slug = event.get("slug", "N/A")
+    active = event.get("active", "N/A")
+    closed = event.get("closed", "N/A")
+    end_date = event.get("endDate", "N/A")
 
     lines = [
-        "🔍 <b>DEBUG BTC POLYMARKET</b>",
+        "🎯 <b>EVENT POLYMARKET CIBLÉ</b>",
         "",
-        f"Marchés trouvés : {len(markets)}",
+        f"<b>Titre :</b> {title}",
+        f"<b>Event ID :</b> <code>{event_id}</code>",
+        f"<b>Slug :</b> <code>{slug}</code>",
+        f"<b>Actif :</b> {active}",
+        f"<b>Fermé :</b> {closed}",
+        f"<b>Fin :</b> {end_date}",
+        "",
+        f"Marchés associés : {len(markets)}",
         "",
     ]
 
-    for i, market in enumerate(markets, start=1):
+    if not markets:
+        lines.append("❌ Aucun marché associé trouvé dans cet event.")
+        return "\n".join(lines)
+
+    for i, market in enumerate(markets[:5], start=1):
         question = market.get("question", "Sans question")
-        title = market.get("title", "Sans titre")
-        slug = market.get("slug", "N/A")
         market_id = market.get("id", "N/A")
-        end_date = market.get("endDate", "N/A")
+        condition_id = market.get("conditionId", "N/A")
+        liquidity = market.get("liquidity", "N/A")
+        volume = market.get("volume", "N/A")
+        outcomes = market.get("outcomes", "N/A")
+        clob_token_ids = market.get("clobTokenIds", "N/A")
 
         lines.append(f"<b>{i}. {question}</b>")
-        lines.append(f"Title : {title}")
-        lines.append(f"Slug : <code>{slug}</code>")
-        lines.append(f"ID : <code>{market_id}</code>")
-        lines.append(f"Fin : {end_date}")
+        lines.append(f"Market ID : <code>{market_id}</code>")
+        lines.append(f"Condition ID : <code>{condition_id}</code>")
+        lines.append(f"Liquidité : {liquidity}")
+        lines.append(f"Volume : {volume}")
+        lines.append(f"Outcomes : <code>{outcomes}</code>")
+        lines.append(f"CLOB Token IDs : <code>{clob_token_ids}</code>")
         lines.append("")
 
     lines.append("Aucun ordre automatique activé.")
@@ -115,18 +120,19 @@ def main():
     status = test_polymarket_import()
 
     try:
-        markets = get_debug_btc_markets()
-        debug_message = format_debug_message(markets)
+        event = get_event_by_slug(EVENT_SLUG)
+        markets = extract_markets_from_event(event)
+        event_message = format_event_message(event, markets)
     except Exception as e:
-        debug_message = f"❌ Erreur debug marchés Polymarket : {e}"
+        event_message = f"❌ Erreur lecture event ciblé : {e}"
 
     send_telegram(
-        "🤖 <b>Bot Polymarket DEBUG démarré</b>\n\n"
+        "🤖 <b>Bot Polymarket SLUG démarré</b>\n\n"
         f"{status}\n\n"
-        f"{debug_message}"
+        f"{event_message}"
     )
 
-    print("Bot debug en ligne. Attente active.")
+    print("Bot slug en ligne. Attente active.")
 
     while True:
         time.sleep(60)

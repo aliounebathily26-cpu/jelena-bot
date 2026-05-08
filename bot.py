@@ -18,7 +18,12 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
+POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY")
+POLY_CHAIN_ID = int(os.getenv("POLY_CHAIN_ID", "137"))
+POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS")
+POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
 
 WINDOW_SECONDS = 15 * 60
 
@@ -43,11 +48,52 @@ def test_polymarket_import():
     if ClobClient is None:
         return f"❌ Import Polymarket échoué : {POLY_IMPORT_ERROR}"
 
+    return "✅ Polymarket importé."
+
+
+def test_polymarket_auth():
+    if ClobClient is None:
+        return "❌ Auth impossible : module Polymarket non importé."
+
+    if not POLY_PRIVATE_KEY:
+        return "❌ Auth impossible : POLY_PRIVATE_KEY manquant."
+
+    if not POLY_FUNDER_ADDRESS:
+        return "❌ Auth impossible : POLY_FUNDER_ADDRESS manquant."
+
     try:
-        ClobClient(POLY_HOST)
-        return "✅ Polymarket importé. Client CLOB créé."
+        temp_client = ClobClient(
+            POLY_HOST,
+            key=POLY_PRIVATE_KEY,
+            chain_id=POLY_CHAIN_ID,
+            signature_type=POLY_SIGNATURE_TYPE,
+            funder=POLY_FUNDER_ADDRESS
+        )
+
+        creds = temp_client.create_or_derive_api_creds()
+
+        client = ClobClient(
+            POLY_HOST,
+            key=POLY_PRIVATE_KEY,
+            chain_id=POLY_CHAIN_ID,
+            creds=creds,
+            signature_type=POLY_SIGNATURE_TYPE,
+            funder=POLY_FUNDER_ADDRESS
+        )
+
+        # Petit test sans ordre : on vérifie que le client L2 existe.
+        if client is None:
+            return "❌ Auth échouée : client L2 non créé."
+
+        return (
+            "✅ Auth Polymarket réussie.\n"
+            "✅ API credentials dérivés.\n"
+            "✅ Client trading initialisé.\n"
+            "⚠️ Aucun ordre placé."
+        )
+
     except Exception as e:
-        return f"⚠️ Polymarket importé, mais client non initialisé : {e}"
+        return f"❌ Auth Polymarket échouée : {e}"
 
 
 def current_15m_timestamp():
@@ -57,10 +103,9 @@ def current_15m_timestamp():
 
 def generate_candidate_slugs():
     base_ts = current_15m_timestamp()
-
     candidates = []
 
-    for offset in [-2, -1, 0, 1, 2]:
+    for offset in [-1, 0, 1, 2]:
         ts = base_ts + (offset * WINDOW_SECONDS)
         slug = f"btc-updown-15m-{ts}"
         candidates.append((slug, ts))
@@ -117,11 +162,9 @@ def get_buy_price(token_id):
 
 
 def find_live_btc_15m_market():
-    candidates = generate_candidate_slugs()
-
     checked = []
 
-    for slug, ts in candidates:
+    for slug, ts in generate_candidate_slugs():
         event = get_event_by_slug(slug)
 
         if not event:
@@ -131,7 +174,7 @@ def find_live_btc_15m_market():
         market = extract_first_market(event)
 
         if not market:
-            checked.append(f"{slug} → event trouvé mais aucun marché")
+            checked.append(f"{slug} → aucun marché")
             continue
 
         outcomes = parse_json_field(market.get("outcomes"))
@@ -177,8 +220,6 @@ def format_market_message(data):
         for item in data.get("checked", []):
             lines.append(f"- {item}")
 
-        lines.append("")
-        lines.append("Aucun ordre automatique activé.")
         return "\n".join(lines)
 
     event = data["event"]
@@ -196,7 +237,7 @@ def format_market_message(data):
     ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     return (
-        "📈 <b>BTC UP/DOWN 15M — AUTO SLUG</b>\n\n"
+        "📈 <b>BTC UP/DOWN 15M — LIVE</b>\n\n"
         f"<b>Titre :</b> {title}\n"
         f"<b>Slug actif :</b> <code>{data['slug']}</code>\n"
         f"<b>Timestamp :</b> {ts_readable}\n"
@@ -205,29 +246,29 @@ def format_market_message(data):
         f"<b>Liquidité :</b> {liquidity}\n"
         f"<b>Volume :</b> {volume}\n\n"
         f"🟢 <b>BUY Up :</b> {data['up_price']}\n"
-        f"🔴 <b>BUY Down :</b> {data['down_price']}\n\n"
-        f"<b>Up Token :</b> <code>{data['token_ids'][0]}</code>\n"
-        f"<b>Down Token :</b> <code>{data['token_ids'][1]}</code>\n\n"
-        "Aucun ordre automatique activé."
+        f"🔴 <b>BUY Down :</b> {data['down_price']}\n"
     )
 
 
 def main():
-    status = test_polymarket_import()
+    import_status = test_polymarket_import()
+    auth_status = test_polymarket_auth()
 
     try:
         market_data = find_live_btc_15m_market()
         market_message = format_market_message(market_data)
     except Exception as e:
-        market_message = f"❌ Erreur auto slug : {e}"
+        market_message = f"❌ Erreur marché live : {e}"
 
     send_telegram(
-        "🤖 <b>Bot Polymarket AUTO SLUG démarré</b>\n\n"
-        f"{status}\n\n"
-        f"{market_message}"
+        "🤖 <b>Bot Polymarket AUTH démarré</b>\n\n"
+        f"{import_status}\n\n"
+        f"{auth_status}\n\n"
+        f"{market_message}\n\n"
+        "Aucun ordre automatique activé."
     )
 
-    print("Bot auto slug en ligne. Attente active.")
+    print("Bot auth en ligne. Attente active.")
 
     while True:
         time.sleep(60)

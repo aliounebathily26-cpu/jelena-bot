@@ -60,7 +60,7 @@ def send_telegram(message):
 
 def test_polymarket_auth():
     if ClobClient is None:
-        return "❌ Module Polymarket non importé."
+        return f"❌ Module Polymarket non importé : {POLY_IMPORT_ERROR}"
 
     if not POLY_PRIVATE_KEY:
         return "❌ POLY_PRIVATE_KEY manquant."
@@ -97,6 +97,57 @@ def test_polymarket_auth():
         return f"❌ Auth Polymarket échouée : {e}"
 
 
+def get_btc_price():
+    url = "https://api.bybit.com/v5/market/tickers"
+
+    params = {
+        "category": "spot",
+        "symbol": "BTCUSDT"
+    }
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("retCode") != 0:
+        raise ValueError(f"Erreur Bybit : {data}")
+
+    ticker = data["result"]["list"][0]
+    return float(ticker["lastPrice"])
+
+
+def update_btc_history(price):
+    now = time.time()
+    price_history.append((now, price))
+
+    while price_history and now - price_history[0][0] > 15 * 60:
+        price_history.popleft()
+
+
+def get_btc_signal():
+    if len(price_history) < 2:
+        return None, 0, "historique BTC insuffisant"
+
+    current_time, current_price = price_history[-1]
+    oldest_time, oldest_price = price_history[0]
+
+    age = current_time - oldest_time
+
+    if age < MIN_BTC_HISTORY_SECONDS:
+        return None, 0, "historique BTC trop court"
+
+    change_pct = ((current_price - oldest_price) / oldest_price) * 100
+
+    if change_pct >= BTC_SIGNAL_THRESHOLD:
+        return "UP", change_pct, "variation BTC haussière"
+
+    if change_pct <= -BTC_SIGNAL_THRESHOLD:
+        return "DOWN", change_pct, "variation BTC baissière"
+
+    return None, change_pct, "variation BTC trop faible"
+
+
 def current_15m_timestamp():
     now = int(time.time())
     return now - (now % WINDOW_SECONDS)
@@ -106,7 +157,7 @@ def generate_candidate_slugs():
     base_ts = current_15m_timestamp()
     candidates = []
 
-    for offset in [-1, 0, 1, 2]:
+    for offset in [0, 1, 2]:
         ts = base_ts + (offset * WINDOW_SECONDS)
         slug = f"btc-updown-15m-{ts}"
         candidates.append((slug, ts))
@@ -167,51 +218,6 @@ def get_buy_price(token_id):
     return float(price)
 
 
-def get_btc_price():
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "bitcoin",
-        "vs_currencies": "usd"
-    }
-
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-
-    data = response.json()
-    return float(data["bitcoin"]["usd"])
-
-
-def update_btc_history(price):
-    now = time.time()
-    price_history.append((now, price))
-
-    while price_history and now - price_history[0][0] > 15 * 60:
-        price_history.popleft()
-
-
-def get_btc_signal():
-    if len(price_history) < 2:
-        return None, 0, "historique BTC insuffisant"
-
-    current_time, current_price = price_history[-1]
-    oldest_time, oldest_price = price_history[0]
-
-    age = current_time - oldest_time
-
-    if age < MIN_BTC_HISTORY_SECONDS:
-        return None, 0, "historique BTC trop court"
-
-    change_pct = ((current_price - oldest_price) / oldest_price) * 100
-
-    if change_pct >= BTC_SIGNAL_THRESHOLD:
-        return "UP", change_pct, "variation BTC haussière"
-
-    if change_pct <= -BTC_SIGNAL_THRESHOLD:
-        return "DOWN", change_pct, "variation BTC baissière"
-
-    return None, change_pct, "variation BTC trop faible"
-
-
 def parse_end_date(end_date):
     if not end_date:
         return None
@@ -222,7 +228,6 @@ def parse_end_date(end_date):
 
 def get_time_left_seconds(event):
     end_date = event.get("endDate")
-
     end_dt = parse_end_date(end_date)
 
     if not end_dt:
@@ -237,6 +242,14 @@ def find_live_btc_15m_market():
         event = get_event_by_slug(slug)
 
         if not event:
+            continue
+
+        time_left = get_time_left_seconds(event)
+
+        if time_left is None:
+            continue
+
+        if time_left < MIN_TIME_LEFT_SECONDS:
             continue
 
         market = extract_first_market(event)
@@ -265,6 +278,7 @@ def find_live_btc_15m_market():
             "token_ids": token_ids,
             "up_price": up_price,
             "down_price": down_price,
+            "time_left": time_left
         }
 
     return None
@@ -277,18 +291,10 @@ def decide_trade(market_data, btc_signal):
         return {
             "decision": "REFUSÉ",
             "side": None,
-            "reason": "aucun marché BTC 15m actif trouvé"
+            "reason": "aucun marché BTC 15m valide trouvé"
         }
 
-    event = market_data["event"]
-    time_left = get_time_left_seconds(event)
-
-    if time_left is None:
-        return {
-            "decision": "REFUSÉ",
-            "side": None,
-            "reason": "temps restant inconnu"
-        }
+    time_left = market_data["time_left"]
 
     if time_left < MIN_TIME_LEFT_SECONDS:
         return {
@@ -352,20 +358,20 @@ def format_message(market_data, btc_price, btc_signal, decision_data):
     if market_data:
         event = market_data["event"]
         market = market_data["market"]
-        time_left = get_time_left_seconds(event)
+        time_left = market_data["time_left"]
 
         lines.extend([
             "📈 <b>Marché détecté</b>",
             f"Titre : {event.get('title', 'N/A')}",
             f"Slug : <code>{market_data['slug']}</code>",
             f"Market ID : <code>{market.get('id', 'N/A')}</code>",
-            f"Temps restant : <b>{time_left // 60 if time_left else 'N/A'} min</b>",
+            f"Temps restant : <b>{time_left // 60} min</b>",
             f"BUY Up : <b>{market_data['up_price']}</b>",
             f"BUY Down : <b>{market_data['down_price']}</b>",
             "",
         ])
     else:
-        lines.append("❌ Aucun marché live trouvé.")
+        lines.append("❌ Aucun marché live valide trouvé.")
         lines.append("")
 
     lines.extend([
@@ -407,6 +413,7 @@ def main():
     send_telegram(
         "🤖 <b>Bot Polymarket décision auto démarré</b>\n\n"
         f"{auth_status}\n\n"
+        "Source BTC : Bybit.\n"
         "Mode actuel : décision automatique seulement.\n"
         "Aucun ordre réel activé."
     )

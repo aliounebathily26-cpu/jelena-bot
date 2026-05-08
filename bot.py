@@ -98,23 +98,13 @@ def test_polymarket_auth():
 
 
 def get_btc_price():
-    url = "https://api.bybit.com/v5/market/tickers"
+    url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
-    params = {
-        "category": "spot",
-        "symbol": "BTCUSDT"
-    }
-
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(url, timeout=10)
     response.raise_for_status()
 
     data = response.json()
-
-    if data.get("retCode") != 0:
-        raise ValueError(f"Erreur Bybit : {data}")
-
-    ticker = data["result"]["list"][0]
-    return float(ticker["lastPrice"])
+    return float(data["data"]["amount"])
 
 
 def update_btc_history(price):
@@ -413,7 +403,7 @@ def main():
     send_telegram(
         "🤖 <b>Bot Polymarket décision auto démarré</b>\n\n"
         f"{auth_status}\n\n"
-        "Source BTC : Bybit.\n"
+        "Source BTC : Coinbase.\n"
         "Mode actuel : décision automatique seulement.\n"
         "Aucun ordre réel activé."
     )

@@ -1,12 +1,14 @@
 import requests
 import time
 import datetime
+from collections import deque
 
 TELEGRAM_TOKEN = "8539436833:AAEbwacljaENAab9bkdn2VY7OMoov503GPQ"
 CHAT_ID = "8754609023"
 COINGECKO_KEY = "CG-4XBTEsUxjpA9RbpgcX8nZRgF"
-
 THRESHOLD = 0.4
+
+price_history = deque(maxlen=20)
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -19,80 +21,63 @@ def send_telegram(message):
 def get_btc_price():
     url = "https://api.coingecko.com/api/v3/simple/price"
     headers = {"x-cg-demo-api-key": COINGECKO_KEY}
-    params = {"ids": "bitcoin", "vs_currencies": "usd", "include_24hr_change": "true"}
+    params = {"ids": "bitcoin", "vs_currencies": "usd"}
     try:
         r = requests.get(url, headers=headers, params=params, timeout=10)
         data = r.json()
-        return data["bitcoin"]["usd"], data["bitcoin"]["usd_24h_change"]
+        return float(data["bitcoin"]["usd"])
     except Exception as e:
         print(f"CoinGecko error: {e}")
-        return None, None
-
-def get_btc_ohlc():
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc"
-    headers = {"x-cg-demo-api-key": COINGECKO_KEY}
-    params = {"vs_currency": "usd", "days": "1"}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        data = r.json()
-        if not data or len(data) < 3:
-            return []
-        candles = []
-        for c in data[-6:]:
-            open_price = float(c[1])
-            close_price = float(c[4])
-            change_pct = ((close_price - open_price) / open_price) * 100
-            candles.append({
-                "open": open_price,
-                "close": close_price,
-                "change_pct": change_pct
-            })
-        return candles
-    except Exception as e:
-        print(f"CoinGecko OHLC error: {e}")
-        return []
-
-def check_signal(candles):
-    if len(candles) < 2:
         return None
-    current = candles[-2]
-    if current["change_pct"] >= THRESHOLD:
-        return "UP"
-    elif current["change_pct"] <= -THRESHOLD:
-        return "DOWN"
-    return None
+
+def check_signal():
+    if len(price_history) < 16:
+        return None, 0
+    current_price = price_history[-1]
+    price_15min_ago = price_history[-16]
+    change_pct = ((current_price - price_15min_ago) / price_15min_ago) * 100
+    if change_pct >= THRESHOLD:
+        return "UP", change_pct
+    elif change_pct <= -THRESHOLD:
+        return "DOWN", change_pct
+    return None, change_pct
 
 def format_signal(direction, price, change):
     trend_emoji = "🟢" if direction == "UP" else "🔴"
     arrow = "⬆️" if direction == "UP" else "⬇️"
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    msg = f"{trend_emoji} <b>SIGNAL JELENA - BTC</b> {trend_emoji}\n\n{arrow} Direction : <b>{direction}</b>\n📊 Variation : <b>{change:+.2f}%</b>\n💰 Prix : <b>${price:,.2f}</b>\n🕐 Heure : {now}"
+    msg = f"{trend_emoji} <b>SIGNAL JELENA - BTC</b> {trend_emoji}\n\n{arrow} Direction : <b>{direction}</b>\n📊 Variation 15min : <b>{change:+.2f}%</b>\n💰 Prix : <b>${price:,.2f}</b>\n🕐 Heure : {now}"
     return msg
 
 def main():
-    send_telegram("🤖 <b>Jelena Bot v4 démarré</b>\nSignaux BTC +/-0.4% - CoinGecko API")
+    send_telegram("🤖 <b>Jelena Bot v5 démarré</b>\nSignaux BTC temps réel - 15min window")
     last_signal = None
     last_signal_time = 0
-    print("Jelena Bot v4 started - CoinGecko API")
+    print("Jelena Bot v5 started")
+
     while True:
         try:
             now = time.time()
-            candles = get_btc_ohlc()
-            price, change_24h = get_btc_price()
-            if not candles or price is None:
-                print("No data, retrying in 60s...")
+            price = get_btc_price()
+
+            if price is None:
                 time.sleep(60)
                 continue
-            signal = check_signal(candles)
-            current_change = candles[-2]["change_pct"] if len(candles) >= 2 else 0
-            print(f"{datetime.datetime.now().strftime('%H:%M')} | BTC: ${price:,.0f} | Change: {current_change:+.2f}% | Signal: {signal}")
+
+            price_history.append(price)
+            signal, change = check_signal()
+
+            print(f"{datetime.datetime.now().strftime('%H:%M')} | BTC: ${price:,.0f} | Change 15min: {change:+.2f}% | Signal: {signal}")
+
             if signal and (now - last_signal_time > 600) and signal != last_signal:
-                message = format_signal(signal, price, current_change)
+                message = format_signal(signal, price, change)
                 send_telegram(message)
                 last_signal = signal
                 last_signal_time = now
                 print(f"Signal sent: {signal}")
+
             time.sleep(60)
+
         except KeyboardInterrupt:
             send_telegram("⏹️ Bot arrêté")
             break

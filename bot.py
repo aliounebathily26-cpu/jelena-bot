@@ -15,19 +15,28 @@ POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
 
 WINDOW_SECONDS = 15 * 60
 
+# =========================
+# RÈGLES JELENA V2
+# =========================
+
 REAL_TRADING_ENABLED = False
 
 MAX_ENTRY_PRICE = 0.80
 MIN_TIME_LEFT_SECONDS = 3 * 60
 MAX_TIME_LEFT_SECONDS = 22 * 60
 
-BTC_SIGNAL_THRESHOLD = 0.03
-MIN_BTC_HISTORY_SECONDS = 60
+BTC_SIGNAL_THRESHOLD = 0.05
+MIN_BTC_HISTORY_SECONDS = 2 * 60
 
 CHECK_INTERVAL_SECONDS = 20
+SIGNAL_COOLDOWN_SECONDS = 60
 
-price_history = deque(maxlen=60)
-last_sent_decision = None
+CONFIRMATION_REQUIRED = 2
+
+price_history = deque(maxlen=80)
+signal_history = deque(maxlen=5)
+
+last_sent_signal = None
 last_sent_time = 0
 
 
@@ -51,7 +60,7 @@ def get_btc_price():
     url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 
     headers = {
-        "User-Agent": "jelena-polymarket-signal-bot/1.0"
+        "User-Agent": "jelena-signal-v2/1.0"
     }
 
     response = requests.get(url, headers=headers, timeout=10)
@@ -73,19 +82,25 @@ def update_btc_history(price):
         price_history.popleft()
 
 
-def get_btc_signal():
+def get_raw_btc_signal():
     if len(price_history) < 2:
         return None, 0, "historique BTC insuffisant"
 
     current_time, current_price = price_history[-1]
-    oldest_time, oldest_price = price_history[0]
 
-    age = current_time - oldest_time
+    selected_old_price = None
+    selected_old_time = None
 
-    if age < MIN_BTC_HISTORY_SECONDS:
+    for timestamp, price in reversed(price_history):
+        if current_time - timestamp >= MIN_BTC_HISTORY_SECONDS:
+            selected_old_time = timestamp
+            selected_old_price = price
+            break
+
+    if selected_old_price is None:
         return None, 0, "historique BTC trop court"
 
-    change_pct = ((current_price - oldest_price) / oldest_price) * 100
+    change_pct = ((current_price - selected_old_price) / selected_old_price) * 100
 
     if change_pct >= BTC_SIGNAL_THRESHOLD:
         return "UP", change_pct, "variation BTC haussière"
@@ -94,6 +109,24 @@ def get_btc_signal():
         return "DOWN", change_pct, "variation BTC baissière"
 
     return None, change_pct, "variation BTC trop faible"
+
+
+def get_confirmed_signal(raw_signal):
+    if raw_signal is None:
+        signal_history.clear()
+        return None, "aucun signal brut"
+
+    signal_history.append(raw_signal)
+
+    if len(signal_history) < CONFIRMATION_REQUIRED:
+        return None, f"confirmation insuffisante : {list(signal_history)}"
+
+    last_signals = list(signal_history)[-CONFIRMATION_REQUIRED:]
+
+    if all(s == raw_signal for s in last_signals):
+        return raw_signal, f"confirmation validée : {last_signals}"
+
+    return None, f"signal instable : {last_signals}"
 
 
 def current_15m_timestamp():
@@ -156,8 +189,8 @@ def get_price(token_id, side):
         return None
 
     response.raise_for_status()
-    data = response.json()
 
+    data = response.json()
     price = data.get("price")
 
     if price is None:
@@ -231,8 +264,20 @@ def find_live_btc_15m_market():
     return None
 
 
-def decide_signal(market_data, btc_signal):
-    signal, change_pct, signal_reason = btc_signal
+def confidence_level(change_pct):
+    abs_change = abs(change_pct)
+
+    if abs_change >= 0.15:
+        return "FORTE"
+
+    if abs_change >= 0.08:
+        return "MOYENNE"
+
+    return "FAIBLE"
+
+
+def decide_signal(market_data, confirmed_signal, raw_signal_data):
+    raw_signal, change_pct, raw_reason = raw_signal_data
 
     if market_data is None:
         return {
@@ -260,15 +305,15 @@ def decide_signal(market_data, btc_signal):
             "reason": f"fenêtre trop tôt : {time_left // 60} min restantes"
         }
 
-    if signal is None:
+    if confirmed_signal is None:
         return {
             "decision": "REFUSÉ",
             "side": None,
             "price": None,
-            "reason": signal_reason
+            "reason": "signal non confirmé"
         }
 
-    if signal == "UP":
+    if confirmed_signal == "UP":
         selected_price = market_data["up_price"]
         selected_side = "UP"
     else:
@@ -287,25 +332,37 @@ def decide_signal(market_data, btc_signal):
         "decision": "SIGNAL VALIDÉ",
         "side": selected_side,
         "price": selected_price,
-        "reason": f"signal {selected_side} + prix OK + timing OK"
+        "reason": f"signal {selected_side} confirmé + prix OK + timing OK"
     }
 
 
-def format_message(market_data, btc_price, btc_signal, decision_data):
-    signal, change_pct, signal_reason = btc_signal
+def format_message(
+    market_data,
+    btc_price,
+    raw_signal_data,
+    confirmed_signal,
+    confirmation_reason,
+    decision_data
+):
+    raw_signal, change_pct, raw_reason = raw_signal_data
+    confidence = confidence_level(change_pct)
 
     lines = [
-        "🧠 <b>JELENA — SIGNAL AGRESSIF</b>",
+        "🧠 <b>JELENA — SIGNAL FILTRÉ V2</b>",
         "",
         f"BTC actuel : <b>${btc_price:,.2f}</b>",
-        f"Signal BTC : <b>{signal or 'AUCUN'}</b>",
-        f"Variation : <b>{change_pct:+.2f}%</b>",
-        f"Raison signal : {signal_reason}",
+        f"Variation 2 min : <b>{change_pct:+.2f}%</b>",
+        f"Signal brut : <b>{raw_signal or 'AUCUN'}</b>",
+        f"Signal confirmé : <b>{confirmed_signal or 'AUCUN'}</b>",
+        f"Confirmation : {confirmation_reason}",
+        f"Confiance : <b>{confidence}</b>",
         "",
-        "⚙️ <b>Règles</b>",
+        "⚙️ <b>Règles actives</b>",
         f"Seuil BTC : <b>{BTC_SIGNAL_THRESHOLD}%</b>",
+        f"Confirmations : <b>{CONFIRMATION_REQUIRED}</b>",
         f"Temps entrée : <b>3 à 22 min restantes</b>",
-        f"Prix max entrée : <b>{MAX_ENTRY_PRICE}</b>",
+        f"Prix max : <b>{MAX_ENTRY_PRICE}</b>",
+        f"Cooldown : <b>{SIGNAL_COOLDOWN_SECONDS} sec</b>",
         "",
     ]
 
@@ -335,23 +392,33 @@ def format_message(market_data, btc_price, btc_signal, decision_data):
         f"Prix : <b>{decision_data.get('price') or 'N/A'}</b>",
         f"Raison : {decision_data['reason']}",
         "",
-        "⚠️ Aucun ordre réel placé. Signal uniquement."
+        "⚠️ Mode : signal uniquement. Aucun ordre réel placé."
     ])
 
     return "\n".join(lines)
 
 
 def should_send(decision_data):
-    global last_sent_decision, last_sent_time
+    global last_sent_signal, last_sent_time
 
     now = time.time()
-    decision_key = f"{decision_data['decision']}|{decision_data.get('side')}|{decision_data['reason']}|{decision_data.get('price')}"
+
+    signal_key = (
+        f"{decision_data['decision']}|"
+        f"{decision_data.get('side')}|"
+        f"{decision_data.get('price')}|"
+        f"{decision_data['reason']}"
+    )
 
     if decision_data["decision"] == "SIGNAL VALIDÉ":
-        return True
+        if now - last_sent_time >= SIGNAL_COOLDOWN_SECONDS:
+            last_sent_signal = signal_key
+            last_sent_time = now
+            return True
+        return False
 
-    if decision_key != last_sent_decision:
-        last_sent_decision = decision_key
+    if signal_key != last_sent_signal:
+        last_sent_signal = signal_key
         last_sent_time = now
         return True
 
@@ -364,30 +431,43 @@ def should_send(decision_data):
 
 def main():
     send_telegram(
-        "🤖 <b>Jelena SIGNAL AGRESSIF démarré</b>\n\n"
+        "🤖 <b>Jelena Signal Filtré V2 démarrée</b>\n\n"
         "Mode : signal uniquement.\n"
         "Aucun ordre réel.\n\n"
         f"Seuil BTC : <b>{BTC_SIGNAL_THRESHOLD}%</b>\n"
+        f"Historique : <b>2 min</b>\n"
+        f"Confirmation : <b>{CONFIRMATION_REQUIRED} signaux même sens</b>\n"
         f"Temps entrée : <b>3 à 22 min restantes</b>\n"
-        f"Prix max entrée : <b>{MAX_ENTRY_PRICE}</b>\n"
+        f"Prix max : <b>{MAX_ENTRY_PRICE}</b>\n"
         f"Check : <b>toutes les {CHECK_INTERVAL_SECONDS} sec</b>"
     )
 
-    print("Jelena signal agressif en ligne.")
+    print("Jelena Signal Filtré V2 en ligne.")
 
     while True:
         try:
             btc_price = get_btc_price()
             update_btc_history(btc_price)
 
-            btc_signal = get_btc_signal()
+            raw_signal_data = get_raw_btc_signal()
+            raw_signal, change_pct, raw_reason = raw_signal_data
+
+            confirmed_signal, confirmation_reason = get_confirmed_signal(raw_signal)
+
             market_data = find_live_btc_15m_market()
-            decision_data = decide_signal(market_data, btc_signal)
+
+            decision_data = decide_signal(
+                market_data,
+                confirmed_signal,
+                raw_signal_data
+            )
 
             message = format_message(
                 market_data,
                 btc_price,
-                btc_signal,
+                raw_signal_data,
+                confirmed_signal,
+                confirmation_reason,
                 decision_data
             )
 
@@ -399,7 +479,7 @@ def main():
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except Exception as e:
-            error_message = f"❌ Erreur Jelena signal : {e}"
+            error_message = f"❌ Erreur Jelena V2 : {e}"
             print(error_message)
             send_telegram(error_message)
             time.sleep(CHECK_INTERVAL_SECONDS)

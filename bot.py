@@ -16,18 +16,23 @@ POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
 WINDOW_SECONDS = 15 * 60
 
 # =========================
-# JELENA V3 — SIGNAL SEMI-AGRESSIF
+# JELENA V4 — SCALPING SIGNAL
 # =========================
 
 REAL_TRADING_ENABLED = False
 
-MAX_ENTRY_PRICE = 0.80
-MIN_TIME_LEFT_SECONDS = 3 * 60
-MAX_TIME_LEFT_SECONDS = 22 * 60
+# Timing marché
+MIN_TIME_LEFT_SECONDS = 2 * 60
+MAX_TIME_LEFT_SECONDS = 18 * 60
 
-WEAK_SIGNAL_THRESHOLD_2M = 0.04
-STRONG_SIGNAL_THRESHOLD_2M = 0.08
-MEDIUM_SIGNAL_THRESHOLD_5M = 0.10
+# Prix Polymarket
+CLEAN_PRICE_MAX = 0.65
+RISKY_PRICE_MAX = 0.80
+
+# Seuils BTC scalping
+WEAK_SIGNAL_THRESHOLD_2M = 0.025
+STRONG_SIGNAL_THRESHOLD_2M = 0.055
+MEDIUM_SIGNAL_THRESHOLD_5M = 0.07
 
 SHORT_WINDOW_SECONDS = 2 * 60
 MEDIUM_WINDOW_SECONDS = 5 * 60
@@ -35,7 +40,7 @@ MEDIUM_WINDOW_SECONDS = 5 * 60
 CONFIRMATION_REQUIRED = 2
 
 CHECK_INTERVAL_SECONDS = 20
-SIGNAL_COOLDOWN_SECONDS = 90
+SIGNAL_COOLDOWN_SECONDS = 60
 
 price_history = deque(maxlen=120)
 weak_signal_history = deque(maxlen=5)
@@ -64,7 +69,7 @@ def get_btc_price():
     url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 
     headers = {
-        "User-Agent": "jelena-signal-v3/1.0"
+        "User-Agent": "jelena-v4-scalping/1.0"
     }
 
     response = requests.get(url, headers=headers, timeout=10)
@@ -91,7 +96,6 @@ def get_change_for_window(window_seconds):
         return None, "historique BTC insuffisant"
 
     current_time, current_price = price_history[-1]
-
     selected_old_price = None
 
     for timestamp, price in reversed(price_history):
@@ -119,7 +123,7 @@ def direction_from_change(change_pct, threshold):
     return None
 
 
-def get_v3_signal():
+def get_v4_signal():
     change_2m, reason_2m = get_change_for_window(SHORT_WINDOW_SECONDS)
     change_5m, reason_5m = get_change_for_window(MEDIUM_WINDOW_SECONDS)
 
@@ -141,7 +145,7 @@ def get_v3_signal():
     medium_5m = direction_from_change(change_5m, MEDIUM_SIGNAL_THRESHOLD_5M)
     weak_2m = direction_from_change(change_2m, WEAK_SIGNAL_THRESHOLD_2M)
 
-    # Signal fort 2 minutes : direct
+    # Signal fort court terme = direct
     if strong_2m:
         weak_signal_history.clear()
         return {
@@ -150,11 +154,11 @@ def get_v3_signal():
             "change_2m": change_2m,
             "change_5m": change_5m,
             "signal_type": "FORT 2M",
-            "reason": f"signal fort 2 min {strong_2m}",
+            "reason": f"mouvement fort 2 min {strong_2m}",
             "confirmation": "validation directe"
         }
 
-    # Signal moyen 5 minutes : direct
+    # Signal moyen 5 minutes = direct
     if medium_5m:
         weak_signal_history.clear()
         return {
@@ -163,11 +167,11 @@ def get_v3_signal():
             "change_2m": change_2m,
             "change_5m": change_5m,
             "signal_type": "MOYEN 5M",
-            "reason": f"signal moyen 5 min {medium_5m}",
+            "reason": f"mouvement moyen 5 min {medium_5m}",
             "confirmation": "validation directe"
         }
 
-    # Signal faible 2 minutes : confirmation requise
+    # Signal faible = confirmation obligatoire
     if weak_2m:
         weak_signal_history.append(weak_2m)
 
@@ -357,10 +361,10 @@ def confidence_level(signal_data):
     abs_2m = abs(signal_data["change_2m"])
     abs_5m = abs(signal_data["change_5m"])
 
-    if abs_2m >= 0.12 or abs_5m >= 0.18:
+    if abs_2m >= 0.09 or abs_5m >= 0.12:
         return "FORTE"
 
-    if abs_2m >= 0.08 or abs_5m >= 0.10:
+    if abs_2m >= 0.055 or abs_5m >= 0.07:
         return "MOYENNE"
 
     if signal_data["confirmed_signal"]:
@@ -377,6 +381,7 @@ def decide_signal(market_data, signal_data):
             "decision": "REFUSÉ",
             "side": None,
             "price": None,
+            "risk_level": None,
             "reason": "aucun marché BTC 15m valide trouvé"
         }
 
@@ -387,6 +392,7 @@ def decide_signal(market_data, signal_data):
             "decision": "REFUSÉ",
             "side": None,
             "price": None,
+            "risk_level": None,
             "reason": f"temps restant trop faible : {time_left // 60} min"
         }
 
@@ -395,6 +401,7 @@ def decide_signal(market_data, signal_data):
             "decision": "REFUSÉ",
             "side": None,
             "price": None,
+            "risk_level": None,
             "reason": f"fenêtre trop tôt : {time_left // 60} min restantes"
         }
 
@@ -403,6 +410,7 @@ def decide_signal(market_data, signal_data):
             "decision": "REFUSÉ",
             "side": None,
             "price": None,
+            "risk_level": None,
             "reason": signal_data["reason"]
         }
 
@@ -413,19 +421,30 @@ def decide_signal(market_data, signal_data):
         selected_price = market_data["down_price"]
         selected_side = "DOWN"
 
-    if selected_price > MAX_ENTRY_PRICE:
+    if selected_price > RISKY_PRICE_MAX:
         return {
             "decision": "REFUSÉ",
             "side": selected_side,
             "price": selected_price,
+            "risk_level": "TROP TARD",
             "reason": f"prix trop élevé : {selected_price}"
         }
 
+    if selected_price <= CLEAN_PRICE_MAX:
+        return {
+            "decision": "SIGNAL PROPRE",
+            "side": selected_side,
+            "price": selected_price,
+            "risk_level": "PROPRE",
+            "reason": f"{signal_data['signal_type']} + prix propre + timing OK"
+        }
+
     return {
-        "decision": "SIGNAL VALIDÉ",
+        "decision": "SIGNAL RISQUÉ",
         "side": selected_side,
         "price": selected_price,
-        "reason": f"{signal_data['signal_type']} + prix OK + timing OK"
+        "risk_level": "RISQUÉ",
+        "reason": f"{signal_data['signal_type']} + prix jouable mais cher"
     }
 
 
@@ -433,23 +452,25 @@ def format_message(market_data, btc_price, signal_data, decision_data):
     confidence = confidence_level(signal_data)
 
     lines = [
-        "🧠 <b>JELENA — SIGNAL V3 SEMI-AGRESSIF</b>",
+        "⚡ <b>JELENA V4 — SCALPING SIGNAL</b>",
         "",
         f"BTC actuel : <b>${btc_price:,.2f}</b>",
-        f"Variation 2 min : <b>{signal_data['change_2m']:+.2f}%</b>",
-        f"Variation 5 min : <b>{signal_data['change_5m']:+.2f}%</b>",
+        f"Variation 2 min : <b>{signal_data['change_2m']:+.3f}%</b>",
+        f"Variation 5 min : <b>{signal_data['change_5m']:+.3f}%</b>",
         f"Signal brut : <b>{signal_data['raw_signal'] or 'AUCUN'}</b>",
         f"Signal confirmé : <b>{signal_data['confirmed_signal'] or 'AUCUN'}</b>",
         f"Type signal : <b>{signal_data['signal_type']}</b>",
         f"Confirmation : {signal_data['confirmation']}",
         f"Confiance : <b>{confidence}</b>",
         "",
-        "⚙️ <b>Règles V3</b>",
+        "⚙️ <b>Règles V4</b>",
         f"Faible 2m : <b>{WEAK_SIGNAL_THRESHOLD_2M}%</b>",
         f"Fort 2m : <b>{STRONG_SIGNAL_THRESHOLD_2M}%</b>",
         f"Moyen 5m : <b>{MEDIUM_SIGNAL_THRESHOLD_5M}%</b>",
-        f"Temps entrée : <b>3 à 22 min restantes</b>",
-        f"Prix max : <b>{MAX_ENTRY_PRICE}</b>",
+        f"Temps entrée : <b>2 à 18 min restantes</b>",
+        f"Prix propre : <b>≤ {CLEAN_PRICE_MAX}</b>",
+        f"Prix risqué : <b>{CLEAN_PRICE_MAX + 0.01:.2f} à {RISKY_PRICE_MAX}</b>",
+        f"Prix interdit : <b>> {RISKY_PRICE_MAX}</b>",
         f"Cooldown : <b>{SIGNAL_COOLDOWN_SECONDS} sec</b>",
         "",
     ]
@@ -478,6 +499,7 @@ def format_message(market_data, btc_price, signal_data, decision_data):
         f"Résultat : <b>{decision_data['decision']}</b>",
         f"Side : <b>{decision_data.get('side') or 'N/A'}</b>",
         f"Prix : <b>{decision_data.get('price') or 'N/A'}</b>",
+        f"Risque : <b>{decision_data.get('risk_level') or 'N/A'}</b>",
         f"Raison : {decision_data['reason']}",
         "",
         "⚠️ Mode : signal uniquement. Aucun ordre réel placé."
@@ -498,7 +520,7 @@ def should_send(decision_data):
         f"{decision_data['reason']}"
     )
 
-    if decision_data["decision"] == "SIGNAL VALIDÉ":
+    if decision_data["decision"] in ["SIGNAL PROPRE", "SIGNAL RISQUÉ"]:
         if now - last_sent_time >= SIGNAL_COOLDOWN_SECONDS:
             last_sent_signal = signal_key
             last_sent_time = now
@@ -519,25 +541,26 @@ def should_send(decision_data):
 
 def main():
     send_telegram(
-        "🤖 <b>Jelena V3 semi-agressive démarrée</b>\n\n"
+        "🤖 <b>Jelena V4 Scalping démarrée</b>\n\n"
         "Mode : signal uniquement.\n"
         "Aucun ordre réel.\n\n"
         f"Faible 2m : <b>{WEAK_SIGNAL_THRESHOLD_2M}%</b>\n"
         f"Fort 2m : <b>{STRONG_SIGNAL_THRESHOLD_2M}%</b>\n"
         f"Moyen 5m : <b>{MEDIUM_SIGNAL_THRESHOLD_5M}%</b>\n"
-        f"Temps entrée : <b>3 à 22 min restantes</b>\n"
-        f"Prix max : <b>{MAX_ENTRY_PRICE}</b>\n"
+        f"Temps entrée : <b>2 à 18 min restantes</b>\n"
+        f"Prix propre : <b>≤ {CLEAN_PRICE_MAX}</b>\n"
+        f"Prix risqué : <b>{CLEAN_PRICE_MAX + 0.01:.2f} à {RISKY_PRICE_MAX}</b>\n"
         f"Check : <b>toutes les {CHECK_INTERVAL_SECONDS} sec</b>"
     )
 
-    print("Jelena V3 semi-agressive en ligne.")
+    print("Jelena V4 Scalping en ligne.")
 
     while True:
         try:
             btc_price = get_btc_price()
             update_btc_history(btc_price)
 
-            signal_data = get_v3_signal()
+            signal_data = get_v4_signal()
             market_data = find_live_btc_15m_market()
             decision_data = decide_signal(market_data, signal_data)
 
@@ -556,7 +579,7 @@ def main():
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except Exception as e:
-            error_message = f"❌ Erreur Jelena V3 : {e}"
+            error_message = f"❌ Erreur Jelena V4 : {e}"
             print(error_message)
             send_telegram(error_message)
             time.sleep(CHECK_INTERVAL_SECONDS)

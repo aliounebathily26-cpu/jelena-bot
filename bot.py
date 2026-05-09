@@ -16,7 +16,7 @@ POLY_HOST = os.getenv("POLY_HOST", "https://clob.polymarket.com")
 WINDOW_SECONDS = 15 * 60
 
 # =========================
-# RÈGLES JELENA V2
+# JELENA V3 — SIGNAL SEMI-AGRESSIF
 # =========================
 
 REAL_TRADING_ENABLED = False
@@ -25,16 +25,20 @@ MAX_ENTRY_PRICE = 0.80
 MIN_TIME_LEFT_SECONDS = 3 * 60
 MAX_TIME_LEFT_SECONDS = 22 * 60
 
-BTC_SIGNAL_THRESHOLD = 0.05
-MIN_BTC_HISTORY_SECONDS = 2 * 60
+WEAK_SIGNAL_THRESHOLD_2M = 0.04
+STRONG_SIGNAL_THRESHOLD_2M = 0.08
+MEDIUM_SIGNAL_THRESHOLD_5M = 0.10
 
-CHECK_INTERVAL_SECONDS = 20
-SIGNAL_COOLDOWN_SECONDS = 60
+SHORT_WINDOW_SECONDS = 2 * 60
+MEDIUM_WINDOW_SECONDS = 5 * 60
 
 CONFIRMATION_REQUIRED = 2
 
-price_history = deque(maxlen=80)
-signal_history = deque(maxlen=5)
+CHECK_INTERVAL_SECONDS = 20
+SIGNAL_COOLDOWN_SECONDS = 90
+
+price_history = deque(maxlen=120)
+weak_signal_history = deque(maxlen=5)
 
 last_sent_signal = None
 last_sent_time = 0
@@ -60,7 +64,7 @@ def get_btc_price():
     url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 
     headers = {
-        "User-Agent": "jelena-signal-v2/1.0"
+        "User-Agent": "jelena-signal-v3/1.0"
     }
 
     response = requests.get(url, headers=headers, timeout=10)
@@ -82,51 +86,136 @@ def update_btc_history(price):
         price_history.popleft()
 
 
-def get_raw_btc_signal():
+def get_change_for_window(window_seconds):
     if len(price_history) < 2:
-        return None, 0, "historique BTC insuffisant"
+        return None, "historique BTC insuffisant"
 
     current_time, current_price = price_history[-1]
 
     selected_old_price = None
-    selected_old_time = None
 
     for timestamp, price in reversed(price_history):
-        if current_time - timestamp >= MIN_BTC_HISTORY_SECONDS:
-            selected_old_time = timestamp
+        if current_time - timestamp >= window_seconds:
             selected_old_price = price
             break
 
     if selected_old_price is None:
-        return None, 0, "historique BTC trop court"
+        return None, f"historique BTC trop court pour {window_seconds // 60} min"
 
     change_pct = ((current_price - selected_old_price) / selected_old_price) * 100
-
-    if change_pct >= BTC_SIGNAL_THRESHOLD:
-        return "UP", change_pct, "variation BTC haussière"
-
-    if change_pct <= -BTC_SIGNAL_THRESHOLD:
-        return "DOWN", change_pct, "variation BTC baissière"
-
-    return None, change_pct, "variation BTC trop faible"
+    return change_pct, "OK"
 
 
-def get_confirmed_signal(raw_signal):
-    if raw_signal is None:
-        signal_history.clear()
-        return None, "aucun signal brut"
+def direction_from_change(change_pct, threshold):
+    if change_pct is None:
+        return None
 
-    signal_history.append(raw_signal)
+    if change_pct >= threshold:
+        return "UP"
 
-    if len(signal_history) < CONFIRMATION_REQUIRED:
-        return None, f"confirmation insuffisante : {list(signal_history)}"
+    if change_pct <= -threshold:
+        return "DOWN"
 
-    last_signals = list(signal_history)[-CONFIRMATION_REQUIRED:]
+    return None
 
-    if all(s == raw_signal for s in last_signals):
-        return raw_signal, f"confirmation validée : {last_signals}"
 
-    return None, f"signal instable : {last_signals}"
+def get_v3_signal():
+    change_2m, reason_2m = get_change_for_window(SHORT_WINDOW_SECONDS)
+    change_5m, reason_5m = get_change_for_window(MEDIUM_WINDOW_SECONDS)
+
+    if change_2m is None:
+        return {
+            "raw_signal": None,
+            "confirmed_signal": None,
+            "change_2m": 0,
+            "change_5m": 0,
+            "signal_type": "AUCUN",
+            "reason": reason_2m,
+            "confirmation": "aucune"
+        }
+
+    if change_5m is None:
+        change_5m = 0
+
+    strong_2m = direction_from_change(change_2m, STRONG_SIGNAL_THRESHOLD_2M)
+    medium_5m = direction_from_change(change_5m, MEDIUM_SIGNAL_THRESHOLD_5M)
+    weak_2m = direction_from_change(change_2m, WEAK_SIGNAL_THRESHOLD_2M)
+
+    # Signal fort 2 minutes : direct
+    if strong_2m:
+        weak_signal_history.clear()
+        return {
+            "raw_signal": strong_2m,
+            "confirmed_signal": strong_2m,
+            "change_2m": change_2m,
+            "change_5m": change_5m,
+            "signal_type": "FORT 2M",
+            "reason": f"signal fort 2 min {strong_2m}",
+            "confirmation": "validation directe"
+        }
+
+    # Signal moyen 5 minutes : direct
+    if medium_5m:
+        weak_signal_history.clear()
+        return {
+            "raw_signal": medium_5m,
+            "confirmed_signal": medium_5m,
+            "change_2m": change_2m,
+            "change_5m": change_5m,
+            "signal_type": "MOYEN 5M",
+            "reason": f"signal moyen 5 min {medium_5m}",
+            "confirmation": "validation directe"
+        }
+
+    # Signal faible 2 minutes : confirmation requise
+    if weak_2m:
+        weak_signal_history.append(weak_2m)
+
+        if len(weak_signal_history) < CONFIRMATION_REQUIRED:
+            return {
+                "raw_signal": weak_2m,
+                "confirmed_signal": None,
+                "change_2m": change_2m,
+                "change_5m": change_5m,
+                "signal_type": "FAIBLE 2M",
+                "reason": "signal faible en attente de confirmation",
+                "confirmation": f"{list(weak_signal_history)}"
+            }
+
+        last_signals = list(weak_signal_history)[-CONFIRMATION_REQUIRED:]
+
+        if all(s == weak_2m for s in last_signals):
+            return {
+                "raw_signal": weak_2m,
+                "confirmed_signal": weak_2m,
+                "change_2m": change_2m,
+                "change_5m": change_5m,
+                "signal_type": "FAIBLE CONFIRMÉ",
+                "reason": f"signal faible confirmé {weak_2m}",
+                "confirmation": f"{last_signals}"
+            }
+
+        return {
+            "raw_signal": weak_2m,
+            "confirmed_signal": None,
+            "change_2m": change_2m,
+            "change_5m": change_5m,
+            "signal_type": "INSTABLE",
+            "reason": "signal faible instable",
+            "confirmation": f"{last_signals}"
+        }
+
+    weak_signal_history.clear()
+
+    return {
+        "raw_signal": None,
+        "confirmed_signal": None,
+        "change_2m": change_2m,
+        "change_5m": change_5m,
+        "signal_type": "AUCUN",
+        "reason": "variation BTC trop faible",
+        "confirmation": "aucune"
+    }
 
 
 def current_15m_timestamp():
@@ -264,20 +353,24 @@ def find_live_btc_15m_market():
     return None
 
 
-def confidence_level(change_pct):
-    abs_change = abs(change_pct)
+def confidence_level(signal_data):
+    abs_2m = abs(signal_data["change_2m"])
+    abs_5m = abs(signal_data["change_5m"])
 
-    if abs_change >= 0.15:
+    if abs_2m >= 0.12 or abs_5m >= 0.18:
         return "FORTE"
 
-    if abs_change >= 0.08:
+    if abs_2m >= 0.08 or abs_5m >= 0.10:
         return "MOYENNE"
 
-    return "FAIBLE"
+    if signal_data["confirmed_signal"]:
+        return "FAIBLE"
+
+    return "AUCUNE"
 
 
-def decide_signal(market_data, confirmed_signal, raw_signal_data):
-    raw_signal, change_pct, raw_reason = raw_signal_data
+def decide_signal(market_data, signal_data):
+    confirmed_signal = signal_data["confirmed_signal"]
 
     if market_data is None:
         return {
@@ -310,7 +403,7 @@ def decide_signal(market_data, confirmed_signal, raw_signal_data):
             "decision": "REFUSÉ",
             "side": None,
             "price": None,
-            "reason": "signal non confirmé"
+            "reason": signal_data["reason"]
         }
 
     if confirmed_signal == "UP":
@@ -332,34 +425,29 @@ def decide_signal(market_data, confirmed_signal, raw_signal_data):
         "decision": "SIGNAL VALIDÉ",
         "side": selected_side,
         "price": selected_price,
-        "reason": f"signal {selected_side} confirmé + prix OK + timing OK"
+        "reason": f"{signal_data['signal_type']} + prix OK + timing OK"
     }
 
 
-def format_message(
-    market_data,
-    btc_price,
-    raw_signal_data,
-    confirmed_signal,
-    confirmation_reason,
-    decision_data
-):
-    raw_signal, change_pct, raw_reason = raw_signal_data
-    confidence = confidence_level(change_pct)
+def format_message(market_data, btc_price, signal_data, decision_data):
+    confidence = confidence_level(signal_data)
 
     lines = [
-        "🧠 <b>JELENA — SIGNAL FILTRÉ V2</b>",
+        "🧠 <b>JELENA — SIGNAL V3 SEMI-AGRESSIF</b>",
         "",
         f"BTC actuel : <b>${btc_price:,.2f}</b>",
-        f"Variation 2 min : <b>{change_pct:+.2f}%</b>",
-        f"Signal brut : <b>{raw_signal or 'AUCUN'}</b>",
-        f"Signal confirmé : <b>{confirmed_signal or 'AUCUN'}</b>",
-        f"Confirmation : {confirmation_reason}",
+        f"Variation 2 min : <b>{signal_data['change_2m']:+.2f}%</b>",
+        f"Variation 5 min : <b>{signal_data['change_5m']:+.2f}%</b>",
+        f"Signal brut : <b>{signal_data['raw_signal'] or 'AUCUN'}</b>",
+        f"Signal confirmé : <b>{signal_data['confirmed_signal'] or 'AUCUN'}</b>",
+        f"Type signal : <b>{signal_data['signal_type']}</b>",
+        f"Confirmation : {signal_data['confirmation']}",
         f"Confiance : <b>{confidence}</b>",
         "",
-        "⚙️ <b>Règles actives</b>",
-        f"Seuil BTC : <b>{BTC_SIGNAL_THRESHOLD}%</b>",
-        f"Confirmations : <b>{CONFIRMATION_REQUIRED}</b>",
+        "⚙️ <b>Règles V3</b>",
+        f"Faible 2m : <b>{WEAK_SIGNAL_THRESHOLD_2M}%</b>",
+        f"Fort 2m : <b>{STRONG_SIGNAL_THRESHOLD_2M}%</b>",
+        f"Moyen 5m : <b>{MEDIUM_SIGNAL_THRESHOLD_5M}%</b>",
         f"Temps entrée : <b>3 à 22 min restantes</b>",
         f"Prix max : <b>{MAX_ENTRY_PRICE}</b>",
         f"Cooldown : <b>{SIGNAL_COOLDOWN_SECONDS} sec</b>",
@@ -431,43 +519,32 @@ def should_send(decision_data):
 
 def main():
     send_telegram(
-        "🤖 <b>Jelena Signal Filtré V2 démarrée</b>\n\n"
+        "🤖 <b>Jelena V3 semi-agressive démarrée</b>\n\n"
         "Mode : signal uniquement.\n"
         "Aucun ordre réel.\n\n"
-        f"Seuil BTC : <b>{BTC_SIGNAL_THRESHOLD}%</b>\n"
-        f"Historique : <b>2 min</b>\n"
-        f"Confirmation : <b>{CONFIRMATION_REQUIRED} signaux même sens</b>\n"
+        f"Faible 2m : <b>{WEAK_SIGNAL_THRESHOLD_2M}%</b>\n"
+        f"Fort 2m : <b>{STRONG_SIGNAL_THRESHOLD_2M}%</b>\n"
+        f"Moyen 5m : <b>{MEDIUM_SIGNAL_THRESHOLD_5M}%</b>\n"
         f"Temps entrée : <b>3 à 22 min restantes</b>\n"
         f"Prix max : <b>{MAX_ENTRY_PRICE}</b>\n"
         f"Check : <b>toutes les {CHECK_INTERVAL_SECONDS} sec</b>"
     )
 
-    print("Jelena Signal Filtré V2 en ligne.")
+    print("Jelena V3 semi-agressive en ligne.")
 
     while True:
         try:
             btc_price = get_btc_price()
             update_btc_history(btc_price)
 
-            raw_signal_data = get_raw_btc_signal()
-            raw_signal, change_pct, raw_reason = raw_signal_data
-
-            confirmed_signal, confirmation_reason = get_confirmed_signal(raw_signal)
-
+            signal_data = get_v3_signal()
             market_data = find_live_btc_15m_market()
-
-            decision_data = decide_signal(
-                market_data,
-                confirmed_signal,
-                raw_signal_data
-            )
+            decision_data = decide_signal(market_data, signal_data)
 
             message = format_message(
                 market_data,
                 btc_price,
-                raw_signal_data,
-                confirmed_signal,
-                confirmation_reason,
+                signal_data,
                 decision_data
             )
 
@@ -479,7 +556,7 @@ def main():
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except Exception as e:
-            error_message = f"❌ Erreur Jelena V2 : {e}"
+            error_message = f"❌ Erreur Jelena V3 : {e}"
             print(error_message)
             send_telegram(error_message)
             time.sleep(CHECK_INTERVAL_SECONDS)
